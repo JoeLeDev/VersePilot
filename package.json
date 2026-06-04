@@ -1,0 +1,57 @@
+{
+  "name": "versepilot-live-desktop",
+  "version": "1.1.0",
+  "private": true,
+  "description": "VersePilot Live desktop app (Electron + React + Node backend)",
+  "main": "electron/main.js",
+  "scripts": {
+    "setup": "npm install --prefix backend && npm install --prefix frontend",
+    "dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\" \"npm run dev:electron\"",
+    "dev:with-mlx": "concurrently -k \"npm run mlx-stt --prefix backend\" \"npm run dev:backend\" \"npm run dev:frontend\" \"npm run dev:electron\"",
+    "mlx-stt": "npm run mlx-stt --prefix backend",
+    "dev:backend": "npm run dev --prefix backend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev:electron": "wait-on tcp:4000 tcp:5173 && electron .",
+    "import-bibles": "npm run import-bibles --prefix backend --",
+    "fix-book-names": "npm run fix-book-names --prefix backend --",
+    "build-embeddings": "npm run build-embeddings --prefix backend --",
+    "build:frontend": "npm run build --prefix frontend",
+    "dist": "npm run setup && npm run build:frontend && electron-builder --mac --dir",
+    "dist:mac": "npm run setup && npm run build:frontend && electron-builder --mac dmg",
+    "dist:win": "npm run setup && npm run build:frontend && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.versepilot.live",
+    "productName": "VersePilot Live",
+    "asar": true,
+    "asarUnpack": [
+      "backend/**"
+    ],
+    "files": [
+      "electron/**/*",
+      "frontend/dist/**/*",
+      "backend/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "build"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.utilities"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    }
+  }
+}

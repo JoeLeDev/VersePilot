@@ -1,0 +1,17 @@
+[
+  { "slug": "fre-bbb", "code": "FreBBB", "name": "Bible Bovet Bonnet (1900)", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FreBBB" },
+  { "slug": "fre-bdm1744", "code": "FreBDM1744", "name": "Bible David Martin (1744)", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FreBDM1744" },
+  { "slug": "fre-crampon", "code": "FreCrampon", "name": "Bible Augustin Crampon (1923)", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FreCrampon" },
+  { "slug": "fre-geneve1669", "code": "FreGeneve1669", "name": "Bible de Genève (1669)", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FreGeneve1669" },
+  { "slug": "fre-jnd", "code": "FreJND", "name": "Bible J.N. Darby (scrollmapper)", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FreJND" },
+  { "slug": "fre-oltramare1874", "code": "FreOltramare1874", "name": "Version Oltramare (1874)", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FreOltramare1874" },
+  { "slug": "fre-pgr", "code": "FrePGR", "name": "Bible Perret-Gentil et Rilliet", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FrePGR" },
+  { "slug": "fre-stapfer1889", "code": "FreStapfer1889", "name": "Bible Stapfer (1889)", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FreStapfer1889" },
+  { "slug": "fre-synodale1921", "code": "FreSynodale1921", "name": "Version Synodale (1921)", "lang": "fr", "source": "scrollmapper", "scrollmapper": "FreSynodale1921" },
+  { "slug": "kjv", "code": "KJV", "name": "King James Version", "lang": "en", "source": "scrollmapper", "scrollmapper": "KJV" },
+  { "slug": "asv", "code": "ASV", "name": "American Standard Version", "lang": "en", "source": "scrollmapper", "scrollmapper": "ASV" },
+  { "slug": "bbe", "code": "BBE", "name": "Bible in Basic English", "lang": "en", "source": "scrollmapper", "scrollmapper": "BBE" },
+  { "slug": "darby-en", "code": "Darby", "name": "Darby Bible (anglais)", "lang": "en", "source": "scrollmapper", "scrollmapper": "Darby" },
+  { "slug": "drc", "code": "DRC", "name": "Douay-Rheims (Challoner)", "lang": "en", "source": "scrollmapper", "scrollmapper": "DRC" },
+  { "slug": "bsb", "code": "BSB", "name": "Berean Standard Bible", "lang": "en", "source": "scrollmapper", "scrollmapper": "BSB" }
+]

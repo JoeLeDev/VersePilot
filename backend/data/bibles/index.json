@@ -1,0 +1,80 @@
+{
+  "updatedAt": "2026-05-20T13:48:18.926Z",
+  "note": "Un fichier JSON par version — ne pas fusionner les versions.",
+  "versions": [
+    {
+      "slug": "francais-courant",
+      "code": "BFC",
+      "name": "Bible en français courant (1997)",
+      "language": "fr",
+      "file": "francais-courant.json",
+      "verseCount": 30739,
+      "available": true,
+      "source": "datagouv-frc97"
+    },
+    {
+      "slug": "bible-expliquee",
+      "code": "BEX",
+      "name": "Bible expliquée",
+      "language": "fr",
+      "file": "bible-expliquee.json",
+      "verseCount": 0,
+      "available": false,
+      "unavailableReason": "Édition commentée sous copyright. Pas de JSON public complet trouvé.",
+      "source": "unavailable"
+    },
+    {
+      "slug": "darby",
+      "code": "JND",
+      "name": "Bible J.N. Darby",
+      "language": "fr",
+      "file": "darby.json",
+      "verseCount": 31172,
+      "available": true,
+      "source": "scrollmapper"
+    },
+    {
+      "slug": "semeur",
+      "code": "BDS",
+      "name": "La Bible du Semeur",
+      "language": "fr",
+      "file": "semeur.json",
+      "verseCount": 0,
+      "available": false,
+      "unavailableReason": "Texte sous copyright (Biblica / Société biblique française). Import manuel ou API sous licence requis.",
+      "source": "unavailable"
+    },
+    {
+      "slug": "parole-de-vie-2017",
+      "code": "PDV17",
+      "name": "La Parole de Vie (2017)",
+      "language": "fr",
+      "file": "parole-de-vie-2017.json",
+      "verseCount": 0,
+      "available": false,
+      "unavailableReason": "Texte sous copyright (Union Biblique Française). Import manuel ou API sous licence requis.",
+      "source": "unavailable"
+    },
+    {
+      "slug": "louis-segond",
+      "code": "LSG",
+      "name": "Louis Segond (1910)",
+      "language": "fr",
+      "file": "louis-segond.json",
+      "verseCount": 31102,
+      "available": true,
+      "source": "baraka-lsg"
+    },
+    {
+      "slug": "segond-21",
+      "code": "S21",
+      "name": "Segond 21",
+      "language": "fr",
+      "file": "segond-21.json",
+      "verseCount": 0,
+      "available": false,
+      "unavailableReason": "Texte sous copyright (Société Biblique de Genève). Non redistribuable en open data. Options : licence éditeur ou import manuel (voir data/bibles/README.md).",
+      "source": "unavailable"
+    }
+  ]
+}

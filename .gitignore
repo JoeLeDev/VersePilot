@@ -1,0 +1,48 @@
+# Dépendances
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+
+# Builds
+dist/
+out/
+release/
+frontend/dist/
+
+# Secrets
+.env
+.env.*
+!.env.example
+!backend/.env.example
+backend/.env
+
+# Bibles & embeddings (lourds — régénérer avec npm run import-bibles / build-embeddings)
+backend/data/bibles/*.json
+!backend/data/bibles/index.json
+backend/data/bibles/*.embeddings.bin
+backend/data/bibles/*.embeddings.meta.json
+
+# Modèles Whisper local (télécharger séparément)
+backend/models/
+backend/models/*.bin
+
+# Python (MLX STT)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs & OS
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# IDE (optionnel)
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Cache
+.cache/
+coverage/
