@@ -21,6 +21,10 @@ import {
   getEmbeddingForIndex,
 } from "./lib/verse-embeddings.js";
 import { detectDirectReferences } from "./lib/direct-reference.js";
+import {
+  applyBiblicalLexicon,
+  getLexiconStats,
+} from "./lib/biblical-lexicon.js";
 
 dotenv.config();
 
@@ -108,6 +112,9 @@ let BIBLE_BOOKS = [];
 const versesByBookNorm = new Map();
 const verseIndexByKey = new Map();
 let embeddingIndex = null;
+
+/** Index par slug pour lecture multi-versions sans recharger la bible active. */
+const bibleIndexCache = new Map();
 
 function listBibleFiles() {
   if (!fs.existsSync(BIBLES_DIR)) return [];
@@ -347,7 +354,7 @@ const BOOK_ALIASES = [
 // --- OpenAI client ---
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY,
     })
   : null;
 
@@ -448,6 +455,109 @@ function tokenize(str) {
 
 function buildReference(v) {
   return `${v.book} ${v.chapter}:${v.verse}`;
+}
+
+function verseCoords(v) {
+  return { book: v.book, chapter: v.chapter, verse: v.verse };
+}
+
+function suggestionFromVerse(v, extra = {}) {
+  return {
+    reference: buildReference(v),
+    version: v.version,
+    text: v.text,
+    ...verseCoords(v),
+    ...extra,
+  };
+}
+
+function getBibleIndexForSlug(slug) {
+  if (bibleIndexCache.has(slug)) return bibleIndexCache.get(slug);
+  const filePath = path.join(BIBLES_DIR, `${slug}.json`);
+  if (!fs.existsSync(filePath)) return null;
+  const payload = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  const verses = payload.verses || [];
+  if (!verses.length) return null;
+  const byKey = new Map();
+  const chapterVerses = new Map();
+  for (const v of verses) {
+    byKey.set(verseKey(v), v);
+    const ck = `${normalize(v.book)}|${v.chapter}`;
+    if (!chapterVerses.has(ck)) chapterVerses.set(ck, []);
+    chapterVerses.get(ck).push(v);
+  }
+  for (const list of chapterVerses.values()) {
+    list.sort((a, b) => a.verse - b.verse);
+  }
+  const index = {
+    meta: payload.meta || { slug, name: slug },
+    verses,
+    byKey,
+    chapterVerses,
+  };
+  bibleIndexCache.set(slug, index);
+  return index;
+}
+
+function findChapterVersesInIndex(index, book, chapter) {
+  const bookNorm = normalize(book);
+  for (const [key, list] of index.chapterVerses.entries()) {
+    const sep = key.lastIndexOf("|");
+    const bk = key.slice(0, sep);
+    const ch = Number(key.slice(sep + 1));
+    if (ch !== chapter) continue;
+    if (bk === bookNorm || bk.includes(bookNorm) || bookNorm.includes(bk)) {
+      return list;
+    }
+  }
+  return [];
+}
+
+function lookupVerseInSlug(slug, book, chapter, verse) {
+  const index = getBibleIndexForSlug(slug);
+  if (!index) return null;
+  const direct = index.byKey.get(verseKey({ book, chapter, verse }));
+  if (direct) return direct;
+  const chapterList = findChapterVersesInIndex(index, book, chapter);
+  return chapterList.find((v) => v.verse === verse) || null;
+}
+
+function getBibleContext(slug, book, chapter, centerVerse, radius = 3) {
+  const index = getBibleIndexForSlug(slug);
+  if (!index) return null;
+  const chapterList = findChapterVersesInIndex(index, book, chapter);
+  if (!chapterList.length) return null;
+  const centerIdx = chapterList.findIndex((v) => v.verse === centerVerse);
+  if (centerIdx < 0) return null;
+  const start = Math.max(0, centerIdx - radius);
+  const end = Math.min(chapterList.length - 1, centerIdx + radius);
+  const center = chapterList[centerIdx];
+  return {
+    book: center.book,
+    chapter,
+    centerVerse,
+    radius,
+    version: slug,
+    versionName: index.meta.name || slug,
+    verses: chapterList.slice(start, end + 1).map((v) => ({
+      ...verseCoords(v),
+      reference: buildReference(v),
+      text: v.text,
+      isCenter: v.verse === centerVerse,
+    })),
+  };
+}
+
+function parseReferenceString(ref) {
+  const m = String(ref || "")
+    .trim()
+    .match(/^(.+?)\s+(\d+)\s*:\s*(\d+)\s*$/);
+  if (!m) return null;
+  return {
+    book: m[1].trim(),
+    chapter: parseInt(m[2], 10),
+    verse: parseInt(m[3], 10),
+  };
 }
 
 function escapeRegex(s) {
@@ -588,15 +698,14 @@ function searchOffline(query, max = 3) {
 
   const boosted = applyChapterBonuses(query, ranked);
 
-  return boosted.slice(0, max).map((v) => ({
-      reference: buildReference(v),
-      version: v.version,
-      text: v.text,
+  return boosted.slice(0, max).map((v) =>
+    suggestionFromVerse(v, {
       reason: v.reason,
       score: v.score,
       tokenHits: v.tokenHits,
       source: v.score >= 90 ? "reference" : "lexical",
-    }));
+    })
+  );
 }
 
 /** Clé de tri : d'abord mots en commun, puis score lexical ; sémantique en appoint. */
@@ -691,15 +800,12 @@ async function searchSemantic(query, max = 5) {
 
   return scored.slice(0, max).map(({ v, sim }) => {
     const semanticPercent = Math.round(sim * 100);
-    return {
-      reference: buildReference(v),
-      version: v.version,
-      text: v.text,
+    return suggestionFromVerse(v, {
       reason: `similarité sémantique ${semanticPercent}%`,
       score: similarityToScore(sim, "semantic"),
       semanticPercent,
       source: "semantic",
-    };
+    });
   });
 }
 
@@ -721,14 +827,14 @@ async function searchWithOpenAI(query, candidates) {
     );
   }
 
-  const candidatesPayload = candidates.map((v, i) => ({
-    id: i,
+    const candidatesPayload = candidates.map((v, i) => ({
+      id: i,
     reference: buildReference(v),
-    version: v.version,
-    text: v.text,
-  }));
+      version: v.version,
+      text: v.text,
+    }));
 
-  const systemPrompt = `Tu es un assistant de recherche biblique pour un régisseur d'église.
+    const systemPrompt = `Tu es un assistant de recherche biblique pour un régisseur d'église.
 À partir d'une requête approximative (phrase entendue, référence, mot-clé), tu identifies 1 à 3 versets pertinents parmi la liste fournie.
 Tu ne dois JAMAIS inventer de versets. Tu choisis uniquement parmi les candidats fournis.
 Tu retournes un JSON strict de la forme :
@@ -739,46 +845,46 @@ Tu retournes un JSON strict de la forme :
 }
 Classe les suggestions par pertinence décroissante. Maximum 3.`;
 
-  const userPrompt = `Requête du régisseur : "${query}"
+    const userPrompt = `Requête du régisseur : "${query}"
 
 Versets candidats :
 ${JSON.stringify(candidatesPayload, null, 2)}
 
 Retourne les 1 à 3 versets les plus pertinents, au format JSON strict.`;
 
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    response_format: { type: "json_object" },
-    temperature: 0.2,
-  });
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.2,
+    });
 
-  const raw = completion.choices[0].message.content;
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
+    const raw = completion.choices[0].message.content;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
     throw new Error("Réponse IA non parsable.");
-  }
+    }
 
   return (parsed.suggestions || [])
-    .slice(0, 3)
+      .slice(0, 3)
     .map((s, idx) => {
-      const verse = candidates[s.id];
-      if (!verse) return null;
-      return {
+        const verse = candidates[s.id];
+        if (!verse) return null;
+        return {
         reference: buildReference(verse),
-        version: verse.version,
-        text: verse.text,
-        reason: s.reason || "",
+          version: verse.version,
+          text: verse.text,
+          reason: s.reason || "",
         score: Math.max(55, 88 - idx * 12),
         source: "ai",
-      };
-    })
-    .filter(Boolean);
+        };
+      })
+      .filter(Boolean);
 }
 
 function buildProPresenterBaseUrl(ip, port) {
@@ -842,6 +948,33 @@ function normalizeMessagesList(payload) {
       raw: m,
     }))
     .filter((m) => Boolean(m.id));
+}
+
+function summarizeMessage(m) {
+  const raw = m.raw || m;
+  const template = String(raw.message || "");
+  const tokens = Array.isArray(raw.tokens) ? raw.tokens : [];
+  return {
+    id: m.id,
+    name: m.name,
+    template,
+    tokenNames: tokens.map((t) => t.name).filter(Boolean),
+    theme: raw.theme?.name || null,
+    isActive: Boolean(raw.is_active),
+  };
+}
+
+function messageIncludesToken(raw, tokenName) {
+  if (!raw || !tokenName) return false;
+  const target = normalize(tokenName);
+  const template = String(raw.message || "");
+  if (template.includes(`{${tokenName}}`)) return true;
+  const tokens = Array.isArray(raw.tokens) ? raw.tokens : [];
+  return tokens.some((t) => normalize(t.name) === target);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function fetchMessages(baseUrl) {
@@ -1284,8 +1417,16 @@ function cleanupTranscribedText(text) {
     out = out.replace(pattern, value);
   }
 
+  out = applyBiblicalLexicon(out);
+
   out = out.replace(/\s+/g, " ").trim();
   return out;
+}
+
+function correctBiblicalSpeech(text) {
+  const base = String(text || "").trim();
+  if (!base) return base;
+  return applyBiblicalLexicon(base).replace(/\s+/g, " ").trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,21 +1479,74 @@ app.post("/bible/select", (req, res) => {
   }
 });
 
+// GET /bible/verse — verset dans une version (sans changer la bible active de recherche)
+app.get("/bible/verse", (req, res) => {
+  try {
+    const slug = String(req.query.version || activeBibleSlug).trim();
+    const book = String(req.query.book || "").trim();
+    const chapter = parseInt(req.query.chapter, 10);
+    const verse = parseInt(req.query.verse, 10);
+    if (!book || !chapter || !verse) {
+      return res.status(400).json({ error: "Paramètres book, chapter, verse requis." });
+    }
+    const v = lookupVerseInSlug(slug, book, chapter, verse);
+    if (!v) {
+      return res.status(404).json({ error: "Verset introuvable dans cette version." });
+    }
+    const index = getBibleIndexForSlug(slug);
+    return res.json({
+      ok: true,
+      ...suggestionFromVerse(v),
+      versionSlug: slug,
+      versionName: index?.meta?.name || v.version || slug,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || "Lecture impossible." });
+  }
+});
+
+// GET /bible/context — ±N versets autour d'une référence
+app.get("/bible/context", (req, res) => {
+  try {
+    const slug = String(req.query.version || activeBibleSlug).trim();
+    let book = String(req.query.book || "").trim();
+    let chapter = parseInt(req.query.chapter, 10);
+    let verse = parseInt(req.query.verse, 10);
+    const radius = Math.min(12, Math.max(1, parseInt(req.query.radius, 10) || 3));
+
+    if ((!book || !chapter || !verse) && req.query.reference) {
+      const parsed = parseReferenceString(req.query.reference);
+      if (parsed) {
+        book = parsed.book;
+        chapter = parsed.chapter;
+        verse = parsed.verse;
+      }
+    }
+    if (!book || !chapter || !verse) {
+      return res.status(400).json({
+        error: "Paramètres book/chapter/verse ou reference requis.",
+      });
+    }
+
+    const ctx = getBibleContext(slug, book, chapter, verse, radius);
+    if (!ctx) {
+      return res.status(404).json({ error: "Contexte introuvable." });
+    }
+    return res.json({ ok: true, ...ctx });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || "Contexte impossible." });
+  }
+});
+
 function lookupVerseByRef(book, chapter, verse) {
   const idx = verseIndexByKey.get(verseKey({ book, chapter, verse }));
   if (idx === undefined) return null;
   const v = VERSES[idx];
-  return {
-    reference: buildReference(v),
-    text: v.text,
-    version: v.version,
-    book: v.book,
-    chapter: v.chapter,
-    verse: v.verse,
+  return suggestionFromVerse(v, {
     score: 98,
     tokenHits: 0,
     source: "reference",
-  };
+  });
 }
 
 function lookupChapterFirstVerse(book, chapter) {
@@ -1378,7 +1572,8 @@ app.post("/detect-references", (req, res) => {
       }
     }
 
-    const { hits, context: nextContext } = detectDirectReferences(text, {
+    const correctedText = correctBiblicalSpeech(text);
+    const { hits, context: nextContext } = detectDirectReferences(correctedText, {
       books: BIBLE_BOOKS,
       normalize,
       context: context || {},
@@ -1390,6 +1585,7 @@ app.post("/detect-references", (req, res) => {
       ok: true,
       hits,
       context: nextContext,
+      correctedText: correctedText !== text.trim() ? correctedText : undefined,
       bibleVersion: activeBibleSlug,
     });
   } catch (err) {
@@ -1404,6 +1600,9 @@ app.post("/search-verse", async (req, res) => {
     if (!query || typeof query !== "string" || query.trim().length === 0) {
       return res.status(400).json({ error: "Champ 'query' requis." });
     }
+
+    const rawQuery = query.trim();
+    const correctedQuery = correctBiblicalSpeech(rawQuery);
 
     if (version && version !== activeBibleSlug) {
       const ok = loadBible(String(version));
@@ -1420,39 +1619,56 @@ app.post("/search-verse", async (req, res) => {
       versionCode: BIBLE_META.code,
     };
 
+    const searchQuery = correctedQuery || rawQuery;
+    const lexiconMeta =
+      correctedQuery && correctedQuery !== rawQuery
+        ? { rawQuery, correctedQuery }
+        : undefined;
+
     const isLive = live === true || live === "true";
     if (isLive) {
-      const suggestions = searchOffline(query, 5);
+      const suggestions = searchOffline(searchQuery, 5);
       return res.json({
         suggestions,
         mode: "offline+live",
         ...bibleInfo,
+        ...lexiconMeta,
       });
     }
 
     const useSemantic = Boolean(embeddingIndex) && SEMANTIC_SEARCH !== "off";
     const offlineSuggestions = useSemantic
-      ? await searchHybridOffline(query, 5)
-      : searchOffline(query, 3);
+      ? await searchHybridOffline(searchQuery, 5)
+      : searchOffline(searchQuery, 3);
     const offlineMode = useSemantic ? "offline+semantic" : "offline";
 
     if (SEARCH_MODE === "offline") {
-      return res.json({ suggestions: offlineSuggestions, mode: offlineMode, ...bibleInfo });
+      return res.json({
+        suggestions: offlineSuggestions,
+        mode: offlineMode,
+        ...bibleInfo,
+        ...lexiconMeta,
+      });
     }
 
     if (SEARCH_MODE === "hybrid") {
       if (offlineSuggestions.length > 0) {
-        return res.json({ suggestions: offlineSuggestions, mode: offlineMode, ...bibleInfo });
+        return res.json({
+          suggestions: offlineSuggestions,
+          mode: offlineMode,
+          ...bibleInfo,
+          ...lexiconMeta,
+        });
       }
-      const candidates = prefilterCandidates(query, 25);
-      const suggestions = await searchWithOpenAI(query, candidates);
-      return res.json({ suggestions, mode: "ai", ...bibleInfo });
+      const candidates = prefilterCandidates(searchQuery, 25);
+      const suggestions = await searchWithOpenAI(searchQuery, candidates);
+      return res.json({ suggestions, mode: "ai", ...bibleInfo, ...lexiconMeta });
     }
 
     // ai mode
-    const candidates = prefilterCandidates(query, 25);
-    const suggestions = await searchWithOpenAI(query, candidates);
-    return res.json({ suggestions, mode: "ai", ...bibleInfo });
+    const candidates = prefilterCandidates(searchQuery, 25);
+    const suggestions = await searchWithOpenAI(searchQuery, candidates);
+    return res.json({ suggestions, mode: "ai", ...bibleInfo, ...lexiconMeta });
   } catch (err) {
     console.error("search-verse error:", err);
     return res.status(500).json({ error: err.message || "Erreur serveur." });
@@ -1500,9 +1716,19 @@ app.post("/send-to-propresenter", async (req, res) => {
     const baseUrl = buildProPresenterBaseUrl(ip, port);
 
     if (dualMessages) {
+      const dualMessageOrder = String(
+        req.body.dualMessageOrder || "verse-first"
+      ).toLowerCase();
+      const dualDelayMs = Math.min(
+        800,
+        Math.max(0, Number(req.body.dualDelayMs) || 220)
+      );
+
       let refMsg;
       let verseMsg;
+      let allMessages;
       try {
+        allMessages = await fetchMessages(baseUrl);
         refMsg = await resolveMessageByName(
           baseUrl,
           refMessageName,
@@ -1519,18 +1745,50 @@ app.post("/send-to-propresenter", async (req, res) => {
         throw err;
       }
 
-      const refTrigger = await triggerProPresenterMessage(baseUrl, refMsg.id, [
-        { name: refTokenName, text: { text: reference } },
-      ]);
-      const verseTrigger = await triggerProPresenterMessage(
-        baseUrl,
-        verseMsg.id,
-        [{ name: textTokenName, text: { text } }]
-      );
+      const verseRaw =
+        allMessages.find((m) => m.id === verseMsg.id)?.raw || null;
+      const refRaw = allMessages.find((m) => m.id === refMsg.id)?.raw || null;
+
+      const refTokens = [{ name: refTokenName, text: { text: reference } }];
+      const verseTokens = [{ name: textTokenName, text: { text } }];
+
+      // Le message « Verset » ne doit pas ré-afficher la référence en mode dual.
+      if (messageIncludesToken(verseRaw, refTokenName)) {
+        verseTokens.push({ name: refTokenName, text: { text: "" } });
+      }
+      if (messageIncludesToken(refRaw, textTokenName)) {
+        refTokens.push({ name: textTokenName, text: { text: "" } });
+      }
+
+      const triggerRef = () =>
+        triggerProPresenterMessage(baseUrl, refMsg.id, refTokens);
+      const triggerVerse = () =>
+        triggerProPresenterMessage(baseUrl, verseMsg.id, verseTokens);
+
+      let refTrigger;
+      let verseTrigger;
+      if (dualMessageOrder === "reference-first") {
+        refTrigger = await triggerRef();
+        if (dualDelayMs) await sleep(dualDelayMs);
+        verseTrigger = await triggerVerse();
+      } else {
+        verseTrigger = await triggerVerse();
+        if (dualDelayMs) await sleep(dualDelayMs);
+        refTrigger = await triggerRef();
+      }
+
+      const setupHints = [];
+      if (messageIncludesToken(verseRaw, refTokenName)) {
+        setupHints.push(
+          `Le message « ${verseMsg.name} » contient aussi le jeton {${refTokenName}} : retire-le du modèle ProPresenter pour un affichage séparé propre.`
+        );
+      }
 
       return res.json({
         ok: true,
         mode: "dual",
+        dualMessageOrder,
+        setupHints: setupHints.length ? setupHints : undefined,
         triggers: [
           {
             role: "reference",
@@ -1598,7 +1856,7 @@ async function transcribeWithDeepgram(audioBuffer) {
   }
 
   const r = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
-    method: "POST",
+      method: "POST",
     headers: {
       Authorization: `Token ${DEEPGRAM_API_KEY}`,
       "Content-Type": "audio/wav",
@@ -1833,7 +2091,7 @@ app.get("/propresenter/messages", async (req, res) => {
       ok: true,
       baseUrl,
       count: messages.length,
-      messages: messages.map((m) => ({ id: m.id, name: m.name })),
+      messages: messages.map((m) => summarizeMessage(m)),
     });
   } catch (err) {
     return res.status(500).json({
@@ -1861,12 +2119,12 @@ app.post("/propresenter/clear", async (req, res) => {
       const url = `${baseUrl}/v1/clear/layer/messages`;
       const ppResponse = await fetch(url);
       const { bodyText } = await readResponseBody(ppResponse);
-      if (!ppResponse.ok) {
-        return res.status(502).json({
-          error: `ProPresenter a répondu ${ppResponse.status}`,
-          details: bodyText,
-          url,
-        });
+    if (!ppResponse.ok) {
+      return res.status(502).json({
+        error: `ProPresenter a répondu ${ppResponse.status}`,
+        details: bodyText,
+        url,
+      });
       }
       return res.json({ ok: true, mode: "layer", url });
     }
@@ -1874,7 +2132,7 @@ app.post("/propresenter/clear", async (req, res) => {
     let resolved;
     try {
       resolved = await resolveMessageByName(baseUrl, messageName, messageId);
-    } catch (err) {
+  } catch (err) {
       if (err.availableMessages) {
         return res.status(404).json({
           error: err.message,
@@ -1940,6 +2198,7 @@ app.get("/health", async (req, res) => {
     mlxSttAvgInferenceMs: mlxProbe.avgInferenceMs,
     openAITranscribeModel: OPENAI_TRANSCRIBE_MODEL,
     openAIConfigured: Boolean(process.env.OPENAI_API_KEY),
+    biblicalLexicon: getLexiconStats(),
     sttCloudReady:
       Boolean(DEEPGRAM_API_KEY) ||
       (Boolean(process.env.OPENAI_API_KEY) && STT_MODE !== "local"),

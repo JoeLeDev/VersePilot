@@ -12,6 +12,7 @@
     "build-embeddings": "node scripts/build-embeddings.mjs",
     "build-embeddings:local": "node scripts/build-embeddings.mjs --local",
     "fix-book-names": "node scripts/fix-book-names.mjs",
+    "build-lexicon": "node scripts/build-biblical-lexicon.mjs",
     "mlx-stt": "python3 scripts/stt/mlx_stt_server.py",
     "embed-server": "python3 scripts/embeddings/local_embed_server.py"
   },

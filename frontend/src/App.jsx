@@ -14,6 +14,7 @@ const defaultConfig = {
   ip: "127.0.0.1",
   port: 50001,
   dualMessages: false,
+  dualMessageOrder: "verse-first",
   messageId: "",
   messageName: "Verset",
   refMessageId: "",
@@ -22,6 +23,7 @@ const defaultConfig = {
   textTokenName: "Verset",
   previewBeforeSend: false,
   verseMaxChars: 220,
+  detectionMinPercent: 80,
   streaming: true,
   noiseSuppression: true,
   echoCancellation: false,
@@ -68,7 +70,10 @@ const MIN_PHRASE_CHARS = 6;
 const LIVE_SEARCH_DEBOUNCE_MS = 120;
 const DETECTION_MIN_SCORE = 22;
 const MAX_DETECTIONS = 40;
+const DETECTIONS_PAGE_SIZE = 10;
 const MAX_QUEUE = 20;
+const CONTEXT_RADIUS = 3;
+const PIN_UNPIN_GRACE_MS = 45000;
 
 function apiUrl(path) {
   return `${API_BASE}${path}`;
@@ -352,6 +357,67 @@ function detectionSourceLabel(source) {
   return "Texte";
 }
 
+/** Score 0-100 d'un verset (score lexical/IA, sinon similarité sémantique). */
+function verseScoreNumber(verse) {
+  if (typeof verse.score === "number" && verse.score > 0) {
+    return Math.min(100, Math.round(verse.score));
+  }
+  if (typeof verse.semanticPercent === "number") {
+    return Math.min(100, Math.round(verse.semanticPercent));
+  }
+  return 0;
+}
+
+/** Palier de confiance pour l'affichage (couleur + libellé). */
+function confidenceTier(score) {
+  if (score >= 85) return { key: "confirmed", label: "Confirmé" };
+  if (score >= 60) return { key: "probable", label: "Probable" };
+  return { key: "hypothesis", label: "Hypothèse" };
+}
+
+/** Tags courts dérivés de la source/des correspondances, sans inventer de data. */
+function parseReference(ref) {
+  const m = String(ref || "")
+    .trim()
+    .match(/^(.+?)\s+(\d+)\s*:\s*(\d+)\s*$/);
+  if (!m) return null;
+  return {
+    book: m[1].trim(),
+    chapter: Number(m[2]),
+    verse: Number(m[3]),
+  };
+}
+
+function ensureVerseCoords(verse) {
+  if (!verse) return verse;
+  if (verse.book && verse.chapter && verse.verse) return verse;
+  const p = parseReference(verse.reference);
+  return p ? { ...verse, ...p } : verse;
+}
+
+function verseIdentityKey(verse) {
+  const v = ensureVerseCoords(verse);
+  if (v.book && v.chapter && v.verse) {
+    return `${v.book}|${v.chapter}|${v.verse}`;
+  }
+  return v.reference || "";
+}
+
+function verseTags(verse) {
+  const tags = [];
+  if (verse.source === "reference" || verse.source === "chapter") {
+    tags.push("référence");
+  }
+  if (verse.source === "semantic") tags.push("thème");
+  if (verse.source === "citation") tags.push("citation");
+  if (verse.source === "lexical") tags.push("mots-clés");
+  if (verse.tokenHits) {
+    tags.push(`${verse.tokenHits} mot${verse.tokenHits > 1 ? "s" : ""}`);
+  }
+  if (!tags.length) tags.push("texte");
+  return tags.slice(0, 3);
+}
+
 export default function App() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
@@ -360,6 +426,13 @@ export default function App() {
   const [config, setConfig] = useState(defaultConfig);
   const [showConfig, setShowConfig] = useState(false);
   const [lastSent, setLastSent] = useState(null);
+  const [lastSentVerse, setLastSentVerse] = useState(null); // verset complet affiché
+  const [pinnedVerse, setPinnedVerse] = useState(null); // verset affiché en tête (même après désépinglage)
+  const [pinActive, setPinActive] = useState(false); // true = verset « Live » actif
+  const unpinGraceTimerRef = useRef(null);
+  const [bibleContext, setBibleContext] = useState(null);
+  const [contextCenter, setContextCenter] = useState(null);
+  const [contextLoading, setContextLoading] = useState(false);
   const [sending, setSending] = useState(null); // reference being sent
   const [history, setHistory] = useState([]);
   const [ppConnected, setPpConnected] = useState(null); // null=inconnu, true, false
@@ -375,8 +448,10 @@ export default function App() {
   );
   const [liveTranscript, setLiveTranscript] = useState("");
   const [fullTranscript, setFullTranscript] = useState("");
+  const [transcriptSegments, setTranscriptSegments] = useState([]);
   const [lastPhrase, setLastPhrase] = useState("");
   const [detections, setDetections] = useState([]);
+  const [detectionsPage, setDetectionsPage] = useState(0);
   const [queue, setQueue] = useState([]);
   const [liveSearching, setLiveSearching] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
@@ -529,8 +604,21 @@ export default function App() {
     previousChunkTailRef.current = "";
     lastPhraseSearchRef.current = "";
     setFullTranscript("");
+    setTranscriptSegments([]);
     setLastPhrase("");
     if (!isListening) setLiveTranscript("");
+  }
+
+  // Ajoute une ligne horodatée au journal de transcription (affichage live).
+  function pushTranscriptSegment(text) {
+    const clean = (text || "").trim();
+    if (!clean) return;
+    setTranscriptSegments((prev) =>
+      [
+        ...prev,
+        { id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, at: Date.now(), text: clean },
+      ].slice(-80)
+    );
   }
 
   // Load config from localStorage on mount
@@ -673,9 +761,16 @@ export default function App() {
         return;
       }
       if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
-      if (["1", "2", "3"].includes(e.key)) {
+      if (["1", "2", "3", "4", "5"].includes(e.key)) {
         const idx = Number(e.key) - 1;
-        const verse = results[idx];
+        const hotList = [];
+        if (pinnedVerse && pinActive) hotList.push(pinnedVerse);
+        const pinKey =
+          pinnedVerse && pinActive ? verseIdentityKey(pinnedVerse) : null;
+        for (const r of results) {
+          if (verseIdentityKey(r) !== pinKey) hotList.push(r);
+        }
+        const verse = hotList[idx];
         if (verse) {
           e.preventDefault();
           requestSend(verse);
@@ -684,7 +779,7 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [results, preview, config]);
+  }, [results, pinnedVerse, pinActive, preview, config]);
 
   function persistHistory(list) {
     try {
@@ -705,6 +800,106 @@ export default function App() {
     });
   }
 
+  function getVerseVersionSlug(verse) {
+    return verse?.versionSlug || bibleVersion;
+  }
+
+  function tagVersesWithSlug(verses, slug = bibleVersion) {
+    return verses.map((v) => ({
+      ...v,
+      versionSlug: v.versionSlug || slug,
+    }));
+  }
+
+  async function resolveVerseInVersion(coords, slug) {
+    const v = ensureVerseCoords(coords);
+    const params = new URLSearchParams({
+      version: slug,
+      book: v.book,
+      chapter: String(v.chapter),
+      verse: String(v.verse),
+    });
+    const r = await fetch(apiUrl(`/bible/verse?${params.toString()}`));
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || "Verset introuvable.");
+    return data;
+  }
+
+  async function loadBibleContext(verse, slug = bibleVersion, radius = CONTEXT_RADIUS) {
+    const v = ensureVerseCoords(verse);
+    if (!v.book || !v.chapter || !v.verse || !slug) {
+      setBibleContext(null);
+      setContextCenter(null);
+      return;
+    }
+    setContextLoading(true);
+    try {
+      const params = new URLSearchParams({
+        version: slug,
+        book: v.book,
+        chapter: String(v.chapter),
+        verse: String(v.verse),
+        radius: String(radius),
+      });
+      const r = await fetch(apiUrl(`/bible/context?${params.toString()}`));
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Contexte introuvable.");
+      setBibleContext(data);
+      setContextCenter({
+        book: data.book,
+        chapter: data.chapter,
+        verse: data.centerVerse,
+      });
+    } catch {
+      /* conserve le contexte affiché si la navigation échoue */
+    } finally {
+      setContextLoading(false);
+    }
+  }
+
+  async function verseWithVersion(verse, slug) {
+    const base = ensureVerseCoords(verse);
+    if (!base?.book || !slug) return verse;
+    try {
+      const data = await resolveVerseInVersion(base, slug);
+      return {
+        ...base,
+        text: data.text,
+        reference: data.reference,
+        version: data.versionName || data.version,
+        versionSlug: slug,
+      };
+    } catch {
+      return verse;
+    }
+  }
+
+  /** Change la version d'un seul verset (indépendant des autres). */
+  async function applyVerseVersion(verse, slug) {
+    if (!slug || !verse) return;
+    const key = verseIdentityKey(verse);
+    const updated = await verseWithVersion(verse, slug);
+    setResults((prev) =>
+      prev.map((v) => (verseIdentityKey(v) === key ? updated : v))
+    );
+    setDetections((prev) =>
+      prev.map((d) =>
+        verseIdentityKey(d.verse) === key
+          ? { ...d, verse: { ...d.verse, ...updated } }
+          : d
+      )
+    );
+    if (pinnedVerse && verseIdentityKey(pinnedVerse) === key) {
+      setPinnedVerse(updated);
+      setLastSentVerse(updated);
+      if (pinActive && lastSent) {
+        void sendToProPresenter(updated, updated.text);
+      }
+      void loadBibleContext(updated, slug);
+    }
+  }
+
+  /** Change la version globale (header) : recherche + tous les versets visibles. */
   async function applyBibleVersion(slug, versionsList = bibleVersions, fallbackName) {
     if (!slug) return;
     const found = versionsList.find((v) => v.slug === slug);
@@ -720,6 +915,33 @@ export default function App() {
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || "Version introuvable.");
+
+      setResults((prev) => {
+        void Promise.all(prev.map((v) => verseWithVersion(v, slug))).then(setResults);
+        return prev;
+      });
+      setDetections((prev) => {
+        void Promise.all(
+          prev.map(async (d) => ({
+            ...d,
+            verse: await verseWithVersion(d.verse, slug),
+          }))
+        ).then(setDetections);
+        return prev;
+      });
+      setPinnedVerse((prev) => {
+        if (!prev) return prev;
+        void verseWithVersion(prev, slug).then((updated) => {
+          setPinnedVerse(updated);
+          setLastSentVerse(updated);
+          if (pinActive && lastSent) {
+            void sendToProPresenter(updated, updated.text);
+          }
+          void loadBibleContext(updated, slug);
+        });
+        return prev;
+      });
+
       if (data.activeName) setBibleVersionName(data.activeName);
       if (data.active) setBibleVersion(data.active);
       setEmbeddingHint(data.embeddingHint || "");
@@ -728,6 +950,41 @@ export default function App() {
     } finally {
       setBibleVersionLoading(false);
     }
+  }
+
+  async function shiftBibleContext(delta) {
+    if (!contextCenter) return;
+    const target = contextCenter.verse + delta;
+    if (target < 1) return;
+    const slug =
+      bibleContext?.version ||
+      getVerseVersionSlug(pinnedVerse) ||
+      bibleVersion;
+    await loadBibleContext({ ...contextCenter, verse: target }, slug, CONTEXT_RADIUS);
+  }
+
+  function schedulePinnedRemoval() {
+    if (unpinGraceTimerRef.current) {
+      clearTimeout(unpinGraceTimerRef.current);
+    }
+    unpinGraceTimerRef.current = setTimeout(() => {
+      setPinnedVerse(null);
+      unpinGraceTimerRef.current = null;
+    }, PIN_UNPIN_GRACE_MS);
+  }
+
+  function handleHypothesisAction(verse, { isPinnedSlot = false, isLive = false }) {
+    if (
+      isPinnedSlot &&
+      isLive &&
+      pinnedVerse &&
+      verseIdentityKey(verse) === verseIdentityKey(pinnedVerse)
+    ) {
+      setPinActive(false);
+      schedulePinnedRemoval();
+      return;
+    }
+    requestSend(verse);
   }
 
   const bibleVersionOptions =
@@ -805,9 +1062,18 @@ export default function App() {
         else if (mode === "ai") source = "ai";
         else source = "semantic";
       }
-      const minScore =
-        source === "reference" || source === "chapter" ? 70 : DETECTION_MIN_SCORE;
-      if (score < minScore && source !== "reference" && source !== "chapter") {
+      const isStrongRef = source === "reference" || source === "chapter";
+      const minScore = isStrongRef ? 70 : DETECTION_MIN_SCORE;
+      if (score < minScore && !isStrongRef) {
+        continue;
+      }
+      // Filtre de pertinence : les matchs sémantiques sous le seuil de
+      // compatibilité (cosinus réel) sont écartés pour éviter le bruit live.
+      if (
+        !isStrongRef &&
+        verse.semanticPercent != null &&
+        verse.semanticPercent < (config.detectionMinPercent || 0)
+      ) {
         continue;
       }
       fresh.push({
@@ -890,7 +1156,7 @@ export default function App() {
     setResults([]);
     try {
       const { suggestions } = await fetchVerseSuggestions(q, controller.signal);
-      setResults(suggestions);
+      setResults(tagVersesWithSlug(suggestions));
       if (!suggestions.length) setError("Aucun verset trouvé.");
     } catch (e) {
       if (e.name === "AbortError") {
@@ -937,8 +1203,19 @@ export default function App() {
         { live: true }
       );
       if (suggestions.length) {
-        setResults(suggestions);
-        pushDetections(normalized, suggestions, mode);
+        // En live, on n'affiche/garde que les versets pertinents pour éviter
+        // que l'écran change en permanence sur des matchs faibles.
+        const pertinent = suggestions.filter((v) => {
+          const strongRef = v.source === "reference" || v.source === "chapter";
+          if (strongRef) return true;
+          if (v.semanticPercent == null) return true;
+          return v.semanticPercent >= (config.detectionMinPercent || 0);
+        });
+        if (pertinent.length) {
+          const tagged = tagVersesWithSlug(pertinent);
+          setResults(tagged);
+          pushDetections(normalized, tagged, mode);
+        }
       }
     } catch (e) {
       if (e.name === "AbortError") return;
@@ -988,6 +1265,7 @@ export default function App() {
           ip: config.ip,
           port: Number(config.port),
           dualMessages: Boolean(config.dualMessages),
+          dualMessageOrder: config.dualMessageOrder || "verse-first",
           messageId: config.messageId || undefined,
           messageName: config.messageName,
           refMessageId: config.refMessageId || undefined,
@@ -1005,6 +1283,19 @@ export default function App() {
         at: new Date(),
         mode: data.mode || "single",
       });
+      if (unpinGraceTimerRef.current) {
+        clearTimeout(unpinGraceTimerRef.current);
+        unpinGraceTimerRef.current = null;
+      }
+      const sent = ensureVerseCoords({
+        ...verse,
+        text: textToSend,
+        versionSlug: getVerseVersionSlug(verse),
+      });
+      setLastSentVerse(sent);
+      setPinnedVerse(sent);
+      setPinActive(true);
+      void loadBibleContext(sent, getVerseVersionSlug(sent));
       setPpConnected(true);
       recordHistory({
         id: `${verse.reference}-${Date.now()}`,
@@ -1038,6 +1329,15 @@ export default function App() {
       if (!r.ok) throw new Error(data.error || "Masquage impossible.");
       setPpConnected(true);
       setLastSent(null);
+      setLastSentVerse(null);
+      setPinnedVerse(null);
+      setPinActive(false);
+      if (unpinGraceTimerRef.current) {
+        clearTimeout(unpinGraceTimerRef.current);
+        unpinGraceTimerRef.current = null;
+      }
+      setBibleContext(null);
+      setContextCenter(null);
     } catch (e) {
       setError(`ProPresenter : ${e.message}`);
     } finally {
@@ -1142,6 +1442,7 @@ export default function App() {
     previousChunkTailRef.current = addition.split(" ").slice(-10).join(" ");
     transcriptRef.current = `${transcriptRef.current} ${addition}`.trim();
     setFullTranscript(transcriptRef.current);
+    pushTranscriptSegment(addition);
     refreshLiveTranscriptLine();
     scheduleReferenceScan(addition || text);
     runLiveDetectionIfNeeded(transcriptRef.current, addition);
@@ -1471,10 +1772,12 @@ export default function App() {
 
   function handleStreamInterim(text) {
     setStreamInterim(text);
-    const committed = transcriptRef.current.trim();
-    const combined = committed ? `${committed} ${text}` : text;
+    // Sur l'interim (qui change en continu) : seulement la détection de
+    // références directes (locale, instantanée). La recherche sémantique ne
+    // se déclenche qu'à la finalisation de phrase pour éviter que les versets
+    // proposés changent trop vite.
+    setLastPhrase(text);
     scheduleReferenceScan(text);
-    runLiveDetectionIfNeeded(combined, text);
   }
 
   function appendStreamingFinal(text) {
@@ -1487,6 +1790,7 @@ export default function App() {
     if (isDuplicateTranscriptAddition(clean, transcriptRef.current)) return;
     transcriptRef.current = `${transcriptRef.current} ${clean}`.trim();
     setFullTranscript(transcriptRef.current);
+    pushTranscriptSegment(clean);
     scheduleReferenceScan(clean);
     runLiveDetectionIfNeeded(transcriptRef.current, clean);
   }
@@ -1669,19 +1973,12 @@ export default function App() {
         clearTimeout(liveSearchDebounceRef.current);
       }
       stopVoiceRecognition();
+      if (unpinGraceTimerRef.current) {
+        clearTimeout(unpinGraceTimerRef.current);
+      }
     };
   }, []);
 
-  const transcriptDisplay = (() => {
-    const base = fullTranscript.trim();
-    if (streamInterim) {
-      return base ? `${base} ${streamInterim}` : streamInterim;
-    }
-    return base || (isListening || isTranscribing ? liveTranscript : "");
-  })();
-  const transcriptParts = splitTranscriptHighlight(
-    fullTranscript.trim() ? fullTranscript : ""
-  );
   const showInterimStatus =
     !fullTranscript.trim() && Boolean(liveTranscript.trim());
 
@@ -1705,6 +2002,156 @@ export default function App() {
     } finally {
       setPpStatusLoading(false);
     }
+  }
+
+  function dismissResult(verseOrIdx) {
+    if (typeof verseOrIdx === "number") {
+      setResults((prev) => prev.filter((_, i) => i !== verseOrIdx));
+      return;
+    }
+    const key = verseIdentityKey(verseOrIdx);
+    setResults((prev) => prev.filter((r) => verseIdentityKey(r) !== key));
+  }
+
+  const detectionsPageCount = Math.max(
+    1,
+    Math.ceil(detections.length / DETECTIONS_PAGE_SIZE)
+  );
+  const detectionsPageSafe = Math.min(detectionsPage, detectionsPageCount - 1);
+  const pagedDetections = detections.slice(
+    detectionsPageSafe * DETECTIONS_PAGE_SIZE,
+    detectionsPageSafe * DETECTIONS_PAGE_SIZE + DETECTIONS_PAGE_SIZE
+  );
+
+  useEffect(() => {
+    const maxPage = Math.max(
+      0,
+      Math.ceil(detections.length / DETECTIONS_PAGE_SIZE) - 1
+    );
+    if (detectionsPage > maxPage) setDetectionsPage(maxPage);
+  }, [detections.length, detectionsPage]);
+
+  // Verset actuellement « à l'écran » pour l'aperçu ProPresenter.
+  const previewVerse =
+    pinnedVerse ||
+    lastSentVerse ||
+    results[0] ||
+    (detections[0] && detections[0].verse) ||
+    null;
+
+  const pinnedKey = pinnedVerse ? verseIdentityKey(pinnedVerse) : null;
+  const resultsBelow = results.filter(
+    (r) => verseIdentityKey(r) !== pinnedKey
+  );
+
+  function renderHypothesisCard(
+    verse,
+    { listIndex, isPinnedSlot = false, isLive = false }
+  ) {
+    const scoreNum = isLive ? 100 : verseScoreNumber(verse);
+    const tier = confidenceTier(scoreNum);
+    const verseSlug = getVerseVersionSlug(verse);
+    return (
+      <article
+        key={`${verseIdentityKey(verse)}-${isPinnedSlot ? "pin" : listIndex}`}
+        className={`hyp-card ${isPinnedSlot ? "is-pinned" : ""} ${
+          isPinnedSlot && !isLive ? "is-pinned-grace" : ""
+        } tier-${isLive ? "confirmed" : tier.key}`}
+      >
+        <div className="hyp-rank">{isPinnedSlot ? "▶" : listIndex + 1}</div>
+        <div className="hyp-body">
+          <div className="hyp-top">
+            <div className="hyp-ref-block">
+              <h2 className="hyp-ref">{verse.reference}</h2>
+              <select
+                className="hyp-version-select"
+                value={verseSlug}
+                disabled={bibleVersionLoading}
+                onChange={(e) => void applyVerseVersion(verse, e.target.value)}
+                title="Version biblique de ce verset"
+              >
+                {bibleVersionOptions.map((opt) => (
+                  <option key={opt.slug} value={opt.slug}>
+                    {opt.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <span className={`hyp-status tier-${isLive ? "confirmed" : tier.key}`}>
+              {isLive ? "En direct" : isPinnedSlot ? "Récent" : tier.label}
+              <strong>{scoreNum}/100</strong>
+            </span>
+          </div>
+          <div className="hyp-score-track" aria-hidden="true">
+            <div
+              className="hyp-score-fill"
+              style={{ width: `${scoreNum}%` }}
+            />
+          </div>
+          <p className="hyp-text">{verse.text}</p>
+          <div className="hyp-footer">
+            <div className="hyp-tags">
+              {verseTags(verse).map((t) => (
+                <span key={t} className="hyp-tag">
+                  {t}
+                </span>
+              ))}
+            </div>
+            <div className="hyp-actions">
+              {!isPinnedSlot && (
+                <button
+                  className="hyp-reject"
+                  title="Rejeter cette hypothèse"
+                  type="button"
+                  onClick={() => dismissResult(verse)}
+                >
+                  ✕
+                </button>
+              )}
+              {isPinnedSlot && !isLive && (
+                <button
+                  className="hyp-reject"
+                  title="Retirer maintenant"
+                  type="button"
+                  onClick={() => {
+                    if (unpinGraceTimerRef.current) {
+                      clearTimeout(unpinGraceTimerRef.current);
+                    }
+                    setPinnedVerse(null);
+                  }}
+                >
+                  ✕
+                </button>
+              )}
+              <button
+                className={`hyp-send ${
+                  isLive ? "is-live" : `tier-${tier.key}`
+                }`}
+                onClick={() =>
+                  handleHypothesisAction(verse, { isPinnedSlot, isLive })
+                }
+                disabled={sending === verse.reference}
+                title={
+                  isLive
+                    ? "Désépingler (le verset reste visible un moment)"
+                    : "Afficher à l'écran"
+                }
+              >
+                {sending === verse.reference
+                  ? "Envoi…"
+                  : isLive
+                    ? "Live"
+                    : "Afficher"}
+                <span className="arrow">→</span>
+                {listIndex < 5 && (
+                  <kbd className="send-kbd">{listIndex + 1}</kbd>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      </article>
+    );
   }
 
   async function loadProPresenterMessages() {
@@ -1822,33 +2269,47 @@ export default function App() {
         />
       )}
 
-      <main className="main dashboard">
-        <div className="dashboard-top">
+      <main className="main board">
+          <aside className="col-left">
           <section className="panel live-panel">
             <div className="panel-head">
               <span className="panel-hint">Transcription live</span>
-              <div className="panel-head-actions">
-                <button
-                  type="button"
-                  className="panel-link-btn"
-                  onClick={clearTranscript}
-                  disabled={!fullTranscript.trim() && !liveTranscript.trim()}
-                  title="Effacer la transcription"
-                >
-                  Effacer
-                </button>
-                <button
-                  className={`voice-btn ${isListening ? "is-listening" : ""}`}
-                  onClick={toggleVoiceRecognition}
-                  title="Dicter par la voix"
-                  disabled={!speechSupported}
-                >
-                  {isListening ? "Stop 🎤" : "Dicter 🎤"}
-                </button>
-              </div>
+              {streamingAvailable && config.streaming && (
+                <span className="live-stream-tag">
+                  <span className="live-stream-dot" /> streaming
+                </span>
+              )}
             </div>
 
-            <div className="audio-controls">
+            <button
+              className={`live-start-btn ${isListening ? "is-live" : ""}`}
+              onClick={toggleVoiceRecognition}
+              disabled={!speechSupported}
+              type="button"
+            >
+              {isListening ? "■ Arrêter le live" : "▶ Démarrer le live"}
+            </button>
+            <div className="live-engine-row">
+              <span className="live-engine-name">
+                {config.streaming && streamingAvailable
+                  ? "Deepgram"
+                  : `STT ${sttMode}`}
+                {bibleVersionName ? ` · ${bibleVersionName}` : ""}
+                {sttEngine ? ` · ${sttEngine}` : ""}
+              </span>
+              <button
+                type="button"
+                className="panel-link-btn"
+                onClick={clearTranscript}
+                disabled={!fullTranscript.trim() && !liveTranscript.trim()}
+                title="Réinitialiser la transcription"
+              >
+                Réinitialiser
+              </button>
+            </div>
+
+            <details className="audio-controls audio-settings">
+              <summary>Réglages audio &amp; moteur</summary>
               <div className="audio-source-row">
                 <span className="audio-controls-label">Source audio</span>
                 <label className="audio-source-option">
@@ -2068,44 +2529,34 @@ export default function App() {
                   </label>
                 </div>
               </div>
-            </div>
+            </details>
 
             <div className="live-transcript-box">
-              {transcriptDisplay ? (
-                <p
-                  className={
-                    showInterimStatus
-                      ? "live-transcript-text live-transcript-interim"
-                      : "live-transcript-text"
-                  }
-                >
-                  {fullTranscript.trim() ? (
-                    <>
-                      {transcriptParts.before && (
-                        <span className="live-transcript-past">
-                          {transcriptParts.before}{" "}
-                        </span>
-                      )}
-                      <span className="live-transcript-last">
-                        {transcriptParts.last || fullTranscript}
-                      </span>
-                      {streamInterim && (
-                        <span className="live-transcript-pending">
-                          {" "}
-                          {streamInterim}
-                        </span>
-                      )}
-                    </>
-                  ) : (
-                    <span className="live-transcript-last">
-                      {streamInterim || liveTranscript}
-                    </span>
-                  )}
+              {transcriptSegments.length === 0 &&
+              !streamInterim &&
+              !(showInterimStatus && liveTranscript) ? (
+                <p className="live-transcript-placeholder">
+                  Démarre le live pour transcrire la prédication en direct.
                 </p>
               ) : (
-                <p className="live-transcript-placeholder">
-                  Clique sur Dicter pour transcrire la prédication en direct.
-                </p>
+                <div className="transcript-feed">
+                  {transcriptSegments.map((seg) => (
+                    <div key={seg.id} className="transcript-line">
+                      <span className="transcript-time">
+                        {formatDetectionTime(seg.at)}
+                      </span>
+                      <span className="transcript-said">{seg.text}</span>
+                    </div>
+                  ))}
+                  {(streamInterim || (showInterimStatus && liveTranscript)) && (
+                    <div className="transcript-line is-pending">
+                      <span className="transcript-time">live</span>
+                      <span className="transcript-said">
+                        {streamInterim || liveTranscript}
+                      </span>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
             <div className="voice-hint-row">
@@ -2144,59 +2595,138 @@ export default function App() {
             )}
           </section>
 
-          <section className="panel queue-panel">
+          <section className="panel detections-panel">
             <div className="panel-head">
-              <span className="panel-hint">File d&apos;attente</span>
-              {queue.length > 0 && (
-                <button
-                  className="panel-link-btn"
-                  onClick={() => setQueue([])}
-                  type="button"
+              <span className="panel-hint">
+                Détections récentes
+                {detections.length > 0 && (
+                  <span className="detections-count"> ({detections.length})</span>
+                )}
+              </span>
+              <div className="detections-head-actions">
+                <label
+                  className="detection-thresh"
+                  title="Seuil de pertinence : n'affiche que les versets dont la compatibilité dépasse cette valeur (les références « Jean 3:16 » passent toujours)"
                 >
-                  Tout effacer
-                </button>
-              )}
+                  Pertinence ≥
+                  <input
+                    type="range"
+                    min="60"
+                    max="95"
+                    step="1"
+                    value={config.detectionMinPercent}
+                    onChange={(e) =>
+                      setConfig({
+                        ...config,
+                        detectionMinPercent: Number(e.target.value),
+                      })
+                    }
+                  />
+                  <span className="detection-thresh-val">
+                    {config.detectionMinPercent}%
+                  </span>
+                </label>
+                {detections.length > 0 && (
+                  <button
+                    className="panel-link-btn"
+                    onClick={() => {
+                      setDetections([]);
+                      setDetectionsPage(0);
+                      persistDetectionsList([]);
+                    }}
+                    type="button"
+                  >
+                    Effacer
+                  </button>
+                )}
+              </div>
             </div>
-            <div className="queue-list">
-              {queue.length === 0 ? (
+            <div className="detections-list">
+              {detections.length === 0 ? (
                 <p className="panel-empty">
-                  Versets en attente d&apos;affichage ProPresenter.
+                  Références entendues (Jean 3:16), chapitres et citations
+                  complètes — conservées en mémoire locale jusqu’à Effacer.
                 </p>
               ) : (
-                queue.map((verse) => (
-                  <div key={verse.reference} className="queue-item">
-                    <div className="queue-item-main">
-                      <strong>{verse.reference}</strong>
-                      <span className="queue-snippet">
-                        {verse.text.slice(0, 72)}
-                        {verse.text.length > 72 ? "…" : ""}
-                      </span>
+                pagedDetections.map((d) => (
+                  <article key={d.id} className="detection-card">
+                    <div className="detection-top">
+                      <div>
+                        <div className="detection-ref-row">
+                          <h3 className="detection-ref">{d.verse.reference}</h3>
+                          <select
+                            className="hyp-version-select detection-version-select"
+                            value={getVerseVersionSlug(d.verse)}
+                            disabled={bibleVersionLoading}
+                            onChange={(e) =>
+                              void applyVerseVersion(d.verse, e.target.value)
+                            }
+                            title="Version de ce verset"
+                          >
+                            {bibleVersionOptions.map((opt) => (
+                              <option key={opt.slug} value={opt.slug}>
+                                {opt.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <span className="detection-meta">
+                          {formatDetectionTime(d.detectedAt)} ·{" "}
+                          {detectionSourceLabel(d.source)} ·{" "}
+                          {verseScoreLabel(d.verse)}
+                        </span>
+                      </div>
+                      <div className="detection-actions">
+                        <button
+                          className="icon-action send"
+                          title="Envoyer à ProPresenter"
+                          onClick={() => requestSend(d.verse)}
+                          disabled={sending === d.verse.reference}
+                        >
+                          {sending === d.verse.reference ? "…" : "▶"}
+                        </button>
+                      </div>
                     </div>
-                    <div className="queue-item-actions">
-                      <button
-                        className="icon-action"
-                        title="Afficher"
-                        onClick={() => requestSend(verse)}
-                        disabled={sending === verse.reference}
-                      >
-                        ▶
-                      </button>
-                      <button
-                        className="icon-action danger"
-                        title="Retirer"
-                        onClick={() => removeFromQueue(verse.reference)}
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  </div>
+                    <p className="detection-text">{d.verse.text}</p>
+                  </article>
                 ))
               )}
             </div>
+            {detections.length > 0 && (
+              <div className="detections-pager">
+                <button
+                  type="button"
+                  className="detections-pager-btn"
+                  disabled={detectionsPageSafe <= 0}
+                  onClick={() => setDetectionsPage((p) => Math.max(0, p - 1))}
+                >
+                  ← Préc.
+                </button>
+                <span className="detections-pager-info">
+                  {detectionsPageSafe + 1} / {detectionsPageCount}
+                  <span className="detections-pager-range">
+                    {" "}
+                    · {pagedDetections.length} sur {detections.length}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  className="detections-pager-btn"
+                  disabled={detectionsPageSafe >= detectionsPageCount - 1}
+                  onClick={() =>
+                    setDetectionsPage((p) =>
+                      Math.min(detectionsPageCount - 1, p + 1)
+                    )
+                  }
+                >
+                  Suiv. →
+                </button>
+              </div>
+            )}
           </section>
-        </div>
+          </aside>
 
-        <div className="search-block">
+        <div className="search-block col-search">
           <label className="search-label" htmlFor="q">
             <span className="search-hint">Recherche manuelle</span>
             <span className="search-sub">
@@ -2254,68 +2784,38 @@ export default function App() {
 
         {error && <div className="error">⚠ {error}</div>}
 
-        <div className="dashboard-bottom">
-          <section className="results panel-suggestions">
-            {results.length > 0 && (
-              <div className="results-header">
-                <span className="results-hint">
-                  {isListening ? "Dernière détection" : "Suggestions"}
-                </span>
-                <span className="results-count">
-                  {results.length} résultat{results.length > 1 ? "s" : ""}
-                </span>
-              </div>
+          <section className="results panel-suggestions col-hyp">
+            <div className="results-header">
+              <span className="results-hint">Hypothèses</span>
+              <span className="results-count">
+                {liveSearching
+                  ? "détection…"
+                  : `${results.length} résultat${
+                      results.length > 1 ? "s" : ""
+                    }`}
+              </span>
+            </div>
+
+            <div className="results-list">
+            {pinnedVerse &&
+              renderHypothesisCard(pinnedVerse, {
+                listIndex: 0,
+                isPinnedSlot: true,
+                isLive: pinActive,
+              })}
+            {resultsBelow.map((verse, idx) =>
+              renderHypothesisCard(verse, {
+                listIndex: pinnedVerse ? idx + 1 : idx,
+                isPinnedSlot: false,
+                isLive: false,
+              })
             )}
 
-            {results.map((verse, idx) => (
-              <article key={`${verse.reference}-${idx}`} className="verse-card compact">
-                <div className="verse-meta">
-                  <span className="verse-index">
-                    {String(idx + 1).padStart(2, "0")}
-                  </span>
-                  <div className="verse-ref-block">
-                    <h2 className="verse-ref">{verse.reference}</h2>
-                    <span className="verse-version">{verse.version}</span>
-                  </div>
-                  {(verse.score != null || verse.tokenHits || verse.source) && (
-                    <span
-                      className={`confidence-pill ${
-                        verse.source === "semantic" ? "is-semantic" : "is-lexical"
-                      }`}
-                      title={verse.reason || ""}
-                    >
-                      {verseScoreLabel(verse)}
-                    </span>
-                  )}
-                </div>
-                <p className="verse-text">{verse.text}</p>
-                {verse.reason && (
-                  <p className="verse-reason">
-                    <span className="reason-label">Pourquoi&nbsp;:</span>{" "}
-                    {verse.reason}
-                  </p>
-                )}
-                <div className="verse-actions row-actions">
-                  <button
-                    className="send-btn"
-                    onClick={() => requestSend(verse)}
-                    disabled={sending === verse.reference}
-                  >
-                    {sending === verse.reference ? "Envoi…" : "Afficher ▶"}
-                    {idx < 3 && <kbd className="send-kbd">{idx + 1}</kbd>}
-                  </button>
-                  <button
-                    className="ghost-btn"
-                    onClick={() => addToQueue(verse)}
-                    type="button"
-                  >
-                    + File
-                  </button>
-                </div>
-              </article>
-            ))}
-
-            {!loading && !liveSearching && results.length === 0 && !error && (
+            {!loading &&
+              !liveSearching &&
+              !pinnedVerse &&
+              results.length === 0 &&
+              !error && (
               <div className="empty">
                 <div className="empty-mark">⌖</div>
                 <p>
@@ -2325,70 +2825,163 @@ export default function App() {
                 </p>
               </div>
             )}
+            </div>
           </section>
 
-          <section className="panel detections-panel">
+          <aside className="col-right">
+          <section className="panel pp-apercu">
             <div className="panel-head">
-              <span className="panel-hint">Détections récentes</span>
-              {detections.length > 0 && (
+              <span className="panel-hint">Aperçu (ProPresenter)</span>
+              {previewVerse && (
                 <button
-                  className="panel-link-btn"
-                  onClick={() => {
-                    setDetections([]);
-                    persistDetectionsList([]);
-                  }}
                   type="button"
+                  className="panel-link-btn"
+                  onClick={() => openPreview(previewVerse)}
+                  title="Aperçu plein écran / pagination"
                 >
-                  Effacer
+                  Plein écran ⤢
                 </button>
               )}
             </div>
-            <div className="detections-list">
-              {detections.length === 0 ? (
-                <p className="panel-empty">
-                  Références entendues (Jean 3:16), chapitres et citations
-                  complètes — conservées en mémoire locale jusqu’à Effacer.
-                </p>
+            <div
+              className={`pp-preview-screen ${lastSentVerse ? "is-onair" : ""}`}
+            >
+              {previewVerse ? (
+                <>
+                  <span className="pp-preview-ref">{previewVerse.reference}</span>
+                  <p className="pp-preview-text">{previewVerse.text}</p>
+                  {previewVerse.version && (
+                    <span className="pp-preview-version">
+                      {previewVerse.version}
+                    </span>
+                  )}
+                </>
               ) : (
-                detections.map((d) => (
-                  <article key={d.id} className="detection-card">
-                    <div className="detection-top">
-                      <div>
-                        <h3 className="detection-ref">{d.verse.reference}</h3>
-                        <span className="detection-meta">
-                          {formatDetectionTime(d.detectedAt)} ·{" "}
-                          {detectionSourceLabel(d.source)} ·{" "}
-                          {verseScoreLabel(d.verse)}
-                        </span>
-                      </div>
-                      <div className="detection-actions">
-                        <button
-                          className="icon-action"
-                          title="Afficher dans ProPresenter"
-                          onClick={() => requestSend(d.verse)}
-                          disabled={sending === d.verse.reference}
-                        >
-                          ▶
-                        </button>
-                        <button
-                          className="icon-action"
-                          title="Ajouter à la file"
-                          onClick={() => addToQueue(d.verse)}
-                        >
-                          +
-                        </button>
-                      </div>
-                    </div>
-                    <p className="detection-text">{d.verse.text}</p>
-                    <p className="detection-phrase">
-                      Phrase : &ldquo;{d.phrase}&rdquo;
-                    </p>
-                  </article>
+                <p className="pp-preview-empty">Aucun verset à l&apos;écran</p>
+              )}
+            </div>
+            {lastSent ? (
+              <div className="pp-preview-foot">
+                <span className="pp-onair-pill">● EN DIRECT</span>
+                <span className="pp-onair-ref">{lastSent.ref}</span>
+                <button
+                  type="button"
+                  className="panel-link-btn"
+                  onClick={hideProPresenter}
+                  disabled={hiding}
+                >
+                  {hiding ? "…" : "Masquer"}
+                </button>
+              </div>
+            ) : (
+              <div className="pp-preview-foot pp-preview-foot-idle">
+                <span>Rien à l&apos;écran</span>
+              </div>
+            )}
+          </section>
+
+          <section className="panel bible-context-panel">
+            <div className="panel-head">
+              <span className="panel-hint">Contexte biblique</span>
+              {contextCenter && (
+                <div className="context-head-meta">
+                  <span className="context-ref-label">
+                    {contextCenter.book} {contextCenter.chapter}:{contextCenter.verse}
+                  </span>
+                  <select
+                    className="hyp-version-select context-version-select"
+                    value={
+                      bibleContext?.version ||
+                      getVerseVersionSlug(pinnedVerse) ||
+                      bibleVersion
+                    }
+                    disabled={contextLoading || bibleVersionLoading}
+                    onChange={(e) => {
+                      const slug = e.target.value;
+                      if (pinnedVerse && pinActive) {
+                        void applyVerseVersion(pinnedVerse, slug);
+                      } else if (contextCenter) {
+                        void loadBibleContext(contextCenter, slug);
+                      }
+                    }}
+                    title="Version du contexte affiché"
+                  >
+                    {bibleVersionOptions.map((opt) => (
+                      <option key={opt.slug} value={opt.slug}>
+                        {opt.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+
+            {(contextCenter || bibleContext?.verses?.length > 0) && (
+              <div className="context-nav">
+                <button
+                  type="button"
+                  className="context-nav-btn"
+                  onClick={() => void shiftBibleContext(-3)}
+                  disabled={contextLoading}
+                  title="Reculer de 3 versets dans le chapitre"
+                >
+                  − 3 versets
+                </button>
+                <span className="context-nav-ref">
+                  {contextCenter
+                    ? `${contextCenter.book} ${contextCenter.chapter}:${contextCenter.verse}`
+                    : "Navigation"}
+                </span>
+                <button
+                  type="button"
+                  className="context-nav-btn"
+                  onClick={() => void shiftBibleContext(3)}
+                  disabled={contextLoading}
+                  title="Avancer de 3 versets dans le chapitre"
+                >
+                  + 3 versets
+                </button>
+              </div>
+            )}
+
+            <div className="context-verses">
+              {contextLoading ? (
+                <p className="panel-empty">Chargement du contexte…</p>
+              ) : bibleContext?.verses?.length ? (
+                bibleContext.verses.map((v) => (
+                  <button
+                    key={`${v.chapter}:${v.verse}`}
+                    type="button"
+                    className={`context-verse-row ${
+                      v.isCenter ? "is-center" : ""
+                    }`}
+                    onClick={() =>
+                      requestSend(
+                        ensureVerseCoords({
+                          reference: v.reference,
+                          text: v.text,
+                          book: v.book || bibleContext.book,
+                          chapter: v.chapter || bibleContext.chapter,
+                          verse: v.verse,
+                          version: bibleContext.versionName,
+                        })
+                      )
+                    }
+                    title="Afficher ce verset"
+                  >
+                    <span className="context-verse-num">{v.verse}</span>
+                    <span className="context-verse-text">{v.text}</span>
+                    {v.isCenter && <span className="context-live-mark">▶</span>}
+                  </button>
                 ))
+              ) : (
+                <p className="panel-empty">
+                  Affiche un verset pour voir le chapitre autour (±{CONTEXT_RADIUS}{" "}
+                  versets).
+                </p>
               )}
             </div>
           </section>
-        </div>
 
         <section className="panel history-panel">
           <div className="panel-head">
@@ -2423,6 +3016,7 @@ export default function App() {
                     </span>
                   </div>
                   <div className="history-side">
+                    <span className="history-check" title="Envoyé">✓</span>
                     <span className="history-time">
                       {formatDetectionTime(h.at)}
                     </span>
@@ -2445,6 +3039,7 @@ export default function App() {
             )}
           </div>
         </section>
+          </aside>
       </main>
 
       {preview && (
@@ -2537,16 +3132,14 @@ export default function App() {
         </div>
       )}
 
-      <footer className="footer">
-        <span>VersePilot Live · MVP v1</span>
-        <span className="footer-sep">·</span>
-        <span>
-          ProPresenter cible : <code>{config.ip}:{config.port}</code>
-        </span>
-        <span className="footer-sep">·</span>
-        <span className="footer-kbd">
-          <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> afficher · <kbd>Échap</kbd>{" "}
-          masquer
+      <footer className="footer shortcut-bar">
+        <span className="shortcut-title">Raccourcis</span>
+        <span className="shortcut"><kbd>1</kbd>–<kbd>5</kbd> Afficher</span>
+        <span className="shortcut"><kbd>Échap</kbd> Masquer</span>
+        <span className="shortcut"><kbd>↵</kbd> Rechercher</span>
+        <span className="shortcut-spacer" />
+        <span className="shortcut-target">
+          ProPresenter <code>{config.ip}:{config.port}</code>
         </span>
       </footer>
     </div>
@@ -2636,6 +3229,23 @@ function ConfigPanel({
                 placeholder="uuid"
                 mono
               />
+              <label className="field field-full">
+                <span className="field-label">Ordre d&apos;affichage (dual)</span>
+                <select
+                  className="field-input"
+                  value={config.dualMessageOrder || "verse-first"}
+                  onChange={(e) =>
+                    setConfig({ ...config, dualMessageOrder: e.target.value })
+                  }
+                >
+                  <option value="verse-first">
+                    Verset puis référence (réf. par-dessus)
+                  </option>
+                  <option value="reference-first">
+                    Référence puis verset
+                  </option>
+                </select>
+              </label>
             </>
           ) : (
             <>
@@ -2699,7 +3309,23 @@ function ConfigPanel({
             <div className="config-debug-title">Messages disponibles</div>
             {ppMessages.map((m) => (
               <div key={m.id} className="message-pick-row">
-                <span className="message-pick-name">{m.name || "Sans nom"}</span>
+                <div className="message-pick-main">
+                  <span className="message-pick-name">{m.name || "Sans nom"}</span>
+                  {m.tokenNames?.length > 0 && (
+                    <span className="message-pick-tokens">
+                      jetons : {m.tokenNames.join(", ")}
+                      {m.theme ? ` · thème ${m.theme}` : ""}
+                    </span>
+                  )}
+                  {config.dualMessages &&
+                    m.name === config.messageName &&
+                    m.tokenNames?.includes(config.refTokenName) && (
+                      <span className="message-pick-warn">
+                        Retire le jeton {config.refTokenName} de ce message en
+                        mode dual.
+                      </span>
+                    )}
+                </div>
                 <code className="message-pick-id">{m.id}</code>
                 {config.dualMessages ? (
                   <div className="message-pick-actions">
@@ -2752,12 +3378,13 @@ function ConfigPanel({
         <p className="config-help">
           {config.dualMessages ? (
             <>
-              Mode <strong>deux messages</strong> : dans ProPresenter, créez{" "}
-              <strong>{config.refMessageName}</strong> (jeton{" "}
-              {config.refTokenName}, thème petit) et{" "}
-              <strong>{config.messageName}</strong> (jeton{" "}
-              {config.textTokenName}, thème grand). Affichez les deux pour
-              tester qu&apos;ils restent visibles ensemble.
+              Mode <strong>deux messages</strong> : message{" "}
+              <strong>{config.refMessageName}</strong> avec uniquement le jeton{" "}
+              {config.refTokenName} (thème petit, ex. Scripture) et message{" "}
+              <strong>{config.messageName}</strong> avec <em>uniquement</em> le
+              jeton {config.textTokenName} (thème grand). Ne mets pas{" "}
+              {config.refTokenName} dans le message verset si tu veux les
+              séparer visuellement.
             </>
           ) : (
             <>
