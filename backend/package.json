@@ -10,13 +10,16 @@
     "import-bibles": "node scripts/import-bibles.mjs",
     "import-bibles:all": "node scripts/import-bibles.mjs --all",
     "build-embeddings": "node scripts/build-embeddings.mjs",
+    "build-embeddings:local": "node scripts/build-embeddings.mjs --local",
     "fix-book-names": "node scripts/fix-book-names.mjs",
-    "mlx-stt": "python3 scripts/stt/mlx_stt_server.py"
+    "mlx-stt": "python3 scripts/stt/mlx_stt_server.py",
+    "embed-server": "python3 scripts/embeddings/local_embed_server.py"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "openai": "^4.67.0"
+    "openai": "^4.67.0",
+    "ws": "^8.21.0"
   }
 }

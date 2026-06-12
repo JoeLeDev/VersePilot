@@ -12,6 +12,7 @@ export default defineConfig({
       "/propresenter": "http://localhost:4000",
       "/transcribe": "http://localhost:4000",
       "/transcribe-offline": "http://localhost:4000",
+      "/stt": { target: "http://localhost:4000", ws: true },
       "/health": "http://localhost:4000",
       "/bible": "http://localhost:4000",
     },

@@ -4,6 +4,8 @@ const LS_KEY = "versepilot.config.v1";
 const LS_BIBLE_KEY = "versepilot.bible.v1";
 const LS_AUDIO_KEY = "versepilot.audio.v1";
 const LS_DETECTIONS_KEY = "versepilot.detections.v1";
+const LS_HISTORY_KEY = "versepilot.history.v1";
+const MAX_HISTORY = 60;
 const MAX_STORED_DETECTIONS = 50;
 const MIC_LEVEL_SCALE = 520;
 const MIC_LEVEL_MIN_SPEECH = 8;
@@ -18,7 +20,34 @@ const defaultConfig = {
   refMessageName: "Reference",
   refTokenName: "Reference",
   textTokenName: "Verset",
+  previewBeforeSend: false,
+  verseMaxChars: 220,
+  streaming: true,
+  noiseSuppression: true,
+  echoCancellation: false,
+  autoGainControl: false,
+  inputGain: 100,
 };
+
+/** Découpe un verset trop long en pages, sans couper les mots. */
+function splitVerseIntoPages(text, maxChars = 220) {
+  const clean = (text || "").trim();
+  const limit = Number(maxChars) > 0 ? Number(maxChars) : 220;
+  if (!clean || clean.length <= limit) return [clean];
+  const words = clean.split(/\s+/);
+  const pages = [];
+  let cur = "";
+  for (const w of words) {
+    if (cur && cur.length + 1 + w.length > limit) {
+      pages.push(cur);
+      cur = w;
+    } else {
+      cur = cur ? `${cur} ${w}` : w;
+    }
+  }
+  if (cur) pages.push(cur);
+  return pages;
+}
 
 const API_BASE =
   window.location.protocol === "file:" ? "http://127.0.0.1:4000" : "";
@@ -29,6 +58,9 @@ const VOICE_CHUNK_MS = 2800;
 const VOICE_CHUNK_MS_SYSTEM = 3600;
 const VOICE_OVERLAP_MS = 900;
 const VOICE_OVERLAP_MS_SYSTEM = 1200;
+// Coupe un bloc plus tôt quand le locuteur fait une pause (frontières plus nettes).
+const VOICE_SILENCE_TAIL_MS = 600;
+const VOICE_MIN_CHUNK_MS = 900;
 const TRANSCRIBE_MAX_PARALLEL = 1;
 const TRANSCRIBE_MAX_PENDING = 2;
 const LAST_PHRASE_MAX_WORDS = 12;
@@ -40,6 +72,73 @@ const MAX_QUEUE = 20;
 
 function apiUrl(path) {
   return `${API_BASE}${path}`;
+}
+
+function wsUrl(path) {
+  if (API_BASE) {
+    return `${API_BASE.replace(/^http/, "ws")}${path}`;
+  }
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${window.location.host}${path}`;
+}
+
+// AudioWorklet : capture du PCM sur le thread audio (remplace ScriptProcessor).
+// Accumule ~2048 échantillons puis les transfère au thread principal.
+const PCM_WORKLET_SRC = `
+class PCMCapture extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buf = [];
+    this._count = 0;
+    this._target = 2048;
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input[0]) {
+      const ch = input[0];
+      this._buf.push(new Float32Array(ch));
+      this._count += ch.length;
+      if (this._count >= this._target) {
+        const merged = new Float32Array(this._count);
+        let o = 0;
+        for (const b of this._buf) { merged.set(b, o); o += b.length; }
+        this.port.postMessage(merged, [merged.buffer]);
+        this._buf = [];
+        this._count = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-capture', PCMCapture);
+`;
+
+const STREAM_TARGET_RATE = 16000;
+
+/** Rééchantillonnage linéaire Float32 vers un autre taux. */
+function resampleFloat32(input, inRate, outRate) {
+  if (inRate === outRate) return input;
+  const ratio = inRate / outRate;
+  const outLength = Math.max(1, Math.floor(input.length / ratio));
+  const out = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i += 1) {
+    const srcPos = i * ratio;
+    const idx = Math.floor(srcPos);
+    const frac = srcPos - idx;
+    const a = input[idx] || 0;
+    const b = input[idx + 1] != null ? input[idx + 1] : a;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+function float32ToInt16Bytes(float32) {
+  const out = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
 }
 
 function isSafariBrowser() {
@@ -262,6 +361,10 @@ export default function App() {
   const [showConfig, setShowConfig] = useState(false);
   const [lastSent, setLastSent] = useState(null);
   const [sending, setSending] = useState(null); // reference being sent
+  const [history, setHistory] = useState([]);
+  const [ppConnected, setPpConnected] = useState(null); // null=inconnu, true, false
+  const [hiding, setHiding] = useState(false);
+  const [preview, setPreview] = useState(null); // { verse, pages, pageIndex }
   const [ppStatus, setPpStatus] = useState(null);
   const [ppStatusLoading, setPpStatusLoading] = useState(false);
   const [ppMessages, setPpMessages] = useState([]);
@@ -287,6 +390,12 @@ export default function App() {
   const meterRafRef = useRef(null);
   const [sttMode, setSttMode] = useState("local");
   const [sttEngine, setSttEngine] = useState("");
+  const [streamingAvailable, setStreamingAvailable] = useState(false);
+  const [streamInterim, setStreamInterim] = useState("");
+  const [sttConfidence, setSttConfidence] = useState(null);
+  const streamWsRef = useRef(null);
+  const streamCtxRef = useRef(null);
+  const streamCleanupRef = useRef(null);
   const [bibleVersions, setBibleVersions] = useState([]);
   const [bibleVersion, setBibleVersion] = useState("");
   const [bibleVersionName, setBibleVersionName] = useState("");
@@ -403,9 +512,9 @@ export default function App() {
 
     const constraints = {
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
+        echoCancellation: Boolean(config.echoCancellation),
+        noiseSuppression: Boolean(config.noiseSuppression),
+        autoGainControl: Boolean(config.autoGainControl),
         channelCount: 1,
       },
     };
@@ -440,6 +549,15 @@ export default function App() {
       }
     } catch {}
     try {
+      const histSaved = localStorage.getItem(LS_HISTORY_KEY);
+      if (histSaved) {
+        const parsed = JSON.parse(histSaved);
+        if (Array.isArray(parsed) && parsed.length) {
+          setHistory(parsed.slice(0, MAX_HISTORY));
+        }
+      }
+    } catch {}
+    try {
       const audioSaved = localStorage.getItem(LS_AUDIO_KEY);
       if (audioSaved) {
         const { deviceId, source } = JSON.parse(audioSaved);
@@ -459,6 +577,7 @@ export default function App() {
         if (data?.sttMode) setSttMode(data.sttMode);
         if (data?.bibleVersion) setBibleVersion(data.bibleVersion);
         if (data?.bibleName) setBibleVersionName(data.bibleName);
+        setStreamingAvailable(Boolean(data?.streamingAvailable));
       })
       .catch(() => {});
 
@@ -505,6 +624,86 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(LS_KEY, JSON.stringify(config));
   }, [config]);
+
+  // Sonde de connexion ProPresenter (état permanent dans la barre)
+  useEffect(() => {
+    let cancelled = false;
+    async function probe() {
+      if (!config.ip || !config.port) {
+        if (!cancelled) setPpConnected(null);
+        return;
+      }
+      try {
+        const params = new URLSearchParams({
+          ip: config.ip,
+          port: String(config.port),
+        });
+        const r = await fetch(apiUrl(`/propresenter/health?${params}`));
+        const data = await r.json();
+        if (!cancelled) setPpConnected(Boolean(r.ok && data.ok));
+      } catch {
+        if (!cancelled) setPpConnected(false);
+      }
+    }
+    probe();
+    const id = setInterval(probe, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [config.ip, config.port]);
+
+  // Raccourcis clavier régie : 1/2/3 = afficher la suggestion, Échap = masquer
+  useEffect(() => {
+    function onKey(e) {
+      const el = e.target;
+      const tag = el?.tagName;
+      const typing =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        el?.isContentEditable;
+
+      if (e.key === "Escape") {
+        if (preview) {
+          setPreview(null);
+        } else {
+          void hideProPresenter();
+        }
+        return;
+      }
+      if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (["1", "2", "3"].includes(e.key)) {
+        const idx = Number(e.key) - 1;
+        const verse = results[idx];
+        if (verse) {
+          e.preventDefault();
+          requestSend(verse);
+        }
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [results, preview, config]);
+
+  function persistHistory(list) {
+    try {
+      localStorage.setItem(
+        LS_HISTORY_KEY,
+        JSON.stringify(list.slice(0, MAX_HISTORY))
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function recordHistory(entry) {
+    setHistory((prev) => {
+      const next = [entry, ...prev].slice(0, MAX_HISTORY);
+      persistHistory(next);
+      return next;
+    });
+  }
 
   async function applyBibleVersion(slug, versionsList = bibleVersions, fallbackName) {
     if (!slug) return;
@@ -763,9 +962,24 @@ export default function App() {
     setQueue((prev) => prev.filter((v) => v.reference !== reference));
   }
 
-  async function sendToProPresenter(verse) {
+  function openPreview(verse) {
+    const pages = splitVerseIntoPages(verse.text, config.verseMaxChars);
+    setPreview({ verse, pages, pageIndex: 0 });
+  }
+
+  // Point d'entrée des boutons "Afficher" : aperçu d'abord si activé.
+  function requestSend(verse) {
+    if (config.previewBeforeSend) {
+      openPreview(verse);
+      return;
+    }
+    void sendToProPresenter(verse);
+  }
+
+  async function sendToProPresenter(verse, overrideText) {
     setSending(verse.reference);
     setError("");
+    const textToSend = overrideText != null ? overrideText : verse.text;
     try {
       const r = await fetch(apiUrl("/send-to-propresenter"), {
         method: "POST",
@@ -781,7 +995,7 @@ export default function App() {
           refTokenName: config.refTokenName,
           textTokenName: config.textTokenName,
           reference: verse.reference,
-          text: verse.text,
+          text: textToSend,
         }),
       });
       const data = await r.json();
@@ -791,11 +1005,50 @@ export default function App() {
         at: new Date(),
         mode: data.mode || "single",
       });
+      setPpConnected(true);
+      recordHistory({
+        id: `${verse.reference}-${Date.now()}`,
+        reference: verse.reference,
+        version: verse.version || "",
+        text: textToSend,
+        at: Date.now(),
+        mode: data.mode || "single",
+      });
     } catch (e) {
       setError(`ProPresenter : ${e.message}`);
     } finally {
       setSending(null);
     }
+  }
+
+  async function hideProPresenter() {
+    setHiding(true);
+    setError("");
+    try {
+      const r = await fetch(apiUrl("/propresenter/clear"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ip: config.ip,
+          port: Number(config.port),
+          all: true,
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Masquage impossible.");
+      setPpConnected(true);
+      setLastSent(null);
+    } catch (e) {
+      setError(`ProPresenter : ${e.message}`);
+    } finally {
+      setHiding(false);
+    }
+  }
+
+  function sendPreviewPage() {
+    if (!preview) return;
+    const text = preview.pages[preview.pageIndex] ?? preview.verse.text;
+    void sendToProPresenter(preview.verse, text);
   }
 
   function onKeyDown(e) {
@@ -955,6 +1208,9 @@ export default function App() {
   function stopVoiceRecognition() {
     listeningRef.current = false;
     setIsListening(false);
+    if (streamCleanupRef.current) {
+      streamCleanupRef.current();
+    }
     stopMeterRef.current?.();
     setMicLevelPct(0);
     resetTranscribePipeline();
@@ -1016,6 +1272,8 @@ export default function App() {
     let totalFrames = 0;
     let speechFrames = 0;
     let rmsSum = 0;
+    let trailingSilentFrames = 0;
+    const frameSamples = 4096;
 
     processor.onaudioprocess = (event) => {
       const channel = event.inputBuffer.getChannelData(0);
@@ -1030,6 +1288,9 @@ export default function App() {
       rmsSum += rms;
       if (rms >= VAD_RMS_THRESHOLD) {
         speechFrames += 1;
+        trailingSilentFrames = 0;
+      } else {
+        trailingSilentFrames += 1;
       }
     };
 
@@ -1039,7 +1300,25 @@ export default function App() {
     processor.connect(silentGain);
     silentGain.connect(audioContext.destination);
 
-    await new Promise((resolve) => setTimeout(resolve, durationMs));
+    // Attend jusqu'à durationMs, mais coupe plus tôt si pause après de la parole.
+    const frameMs = (frameSamples / sampleRate) * 1000;
+    const startedAt = Date.now();
+    await new Promise((resolve) => {
+      const check = () => {
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= durationMs) return resolve();
+        const trailingSilenceMs = trailingSilentFrames * frameMs;
+        if (
+          elapsed >= VOICE_MIN_CHUNK_MS &&
+          speechFrames > 0 &&
+          trailingSilenceMs >= VOICE_SILENCE_TAIL_MS
+        ) {
+          return resolve();
+        }
+        setTimeout(check, 50);
+      };
+      setTimeout(check, 50);
+    });
 
     processor.disconnect();
     source.disconnect();
@@ -1051,6 +1330,16 @@ export default function App() {
     for (const c of chunks) {
       merged.set(c, offset);
       offset += c.length;
+    }
+
+    const gainFactor = Math.max(
+      0,
+      Math.min(3, (Number(config.inputGain) || 100) / 100)
+    );
+    if (gainFactor !== 1) {
+      for (let i = 0; i < merged.length; i += 1) {
+        merged[i] = Math.max(-1, Math.min(1, merged[i] * gainFactor));
+      }
     }
 
     let pcm = merged;
@@ -1180,6 +1469,155 @@ export default function App() {
     }
   }
 
+  function handleStreamInterim(text) {
+    setStreamInterim(text);
+    const committed = transcriptRef.current.trim();
+    const combined = committed ? `${committed} ${text}` : text;
+    scheduleReferenceScan(text);
+    runLiveDetectionIfNeeded(combined, text);
+  }
+
+  function appendStreamingFinal(text) {
+    const clean = (text || "").trim();
+    setStreamInterim("");
+    if (!clean) return;
+    if (isSttPromptEchoText(clean) || isSttRepetitiveHallucination(clean)) {
+      return;
+    }
+    if (isDuplicateTranscriptAddition(clean, transcriptRef.current)) return;
+    transcriptRef.current = `${transcriptRef.current} ${clean}`.trim();
+    setFullTranscript(transcriptRef.current);
+    scheduleReferenceScan(clean);
+    runLiveDetectionIfNeeded(transcriptRef.current, clean);
+  }
+
+  async function startStreamingRecognition() {
+    let stream;
+    try {
+      stream = await acquireListenStream(audioSource, selectedDeviceId);
+    } catch (e) {
+      setError(`Dictée : ${formatCaptureError(e)}`);
+      listeningRef.current = false;
+      setIsListening(false);
+      return;
+    }
+    startMicLevelMeter(stream);
+
+    const ctx = new window.AudioContext();
+    streamCtxRef.current = ctx;
+    const inRate = ctx.sampleRate;
+    const source = ctx.createMediaStreamSource(stream);
+    const gain = ctx.createGain();
+    gain.gain.value = Math.max(
+      0,
+      Math.min(3, (Number(config.inputGain) || 100) / 100)
+    );
+
+    let workletNode = null;
+    let ws = null;
+    let closed = false;
+
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "CloseStream" }));
+        }
+      } catch {
+        /* ignore */
+      }
+      try {
+        ws && ws.close();
+      } catch {
+        /* ignore */
+      }
+      try {
+        workletNode && workletNode.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        gain.disconnect();
+        source.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        ctx.close();
+      } catch {
+        /* ignore */
+      }
+      stopMeterRef.current?.();
+      stream.getTracks().forEach((t) => t.stop());
+      setMicLevelPct(0);
+      setStreamInterim("");
+      streamWsRef.current = null;
+      streamCtxRef.current = null;
+      streamCleanupRef.current = null;
+    };
+    streamCleanupRef.current = cleanup;
+
+    try {
+      const blob = new Blob([PCM_WORKLET_SRC], {
+        type: "application/javascript",
+      });
+      const moduleUrl = URL.createObjectURL(blob);
+      await ctx.audioWorklet.addModule(moduleUrl);
+      URL.revokeObjectURL(moduleUrl);
+      workletNode = new AudioWorkletNode(ctx, "pcm-capture");
+    } catch (e) {
+      setError("AudioWorklet indisponible — bascule en mode blocs.");
+      cleanup();
+      if (listeningRef.current) startVoiceRecognition();
+      return;
+    }
+
+    ws = new WebSocket(wsUrl(`/stt/stream?sampleRate=${STREAM_TARGET_RATE}`));
+    ws.binaryType = "arraybuffer";
+    streamWsRef.current = ws;
+
+    ws.onmessage = (ev) => {
+      let data;
+      try {
+        data = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (data.type === "error") {
+        setError(`Streaming : ${data.error}`);
+        return;
+      }
+      if (data.type === "transcript") {
+        if (data.confidence != null) setSttConfidence(data.confidence);
+        if (data.isFinal) appendStreamingFinal(data.text);
+        else handleStreamInterim(data.text);
+      }
+    };
+    ws.onerror = () => {
+      if (listeningRef.current) setError("Connexion streaming interrompue.");
+    };
+
+    workletNode.port.onmessage = (e) => {
+      if (!listeningRef.current || closed) return;
+      const float = e.data;
+      const resampled = resampleFloat32(float, inRate, STREAM_TARGET_RATE);
+      const int16 = float32ToInt16Bytes(resampled);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(int16.buffer);
+      }
+    };
+
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    source.connect(gain);
+    gain.connect(workletNode);
+    workletNode.connect(sink);
+    sink.connect(ctx.destination);
+
+    setLiveTranscript("Écoute du micro… (temps réel)");
+  }
+
   function toggleVoiceRecognition() {
     if (isListening) {
       stopVoiceRecognition();
@@ -1206,6 +1644,13 @@ export default function App() {
     }
     listeningRef.current = true;
     setIsListening(true);
+    setSttConfidence(null);
+    setStreamInterim("");
+    const useStreaming = config.streaming && streamingAvailable;
+    if (useStreaming) {
+      void startStreamingRecognition();
+      return;
+    }
     if (sttMode === "mlx" || sttMode === "hybrid") {
       void fetch(apiUrl("/stt/warmup"), { method: "POST" }).catch(() => {});
     }
@@ -1227,9 +1672,13 @@ export default function App() {
     };
   }, []);
 
-  const transcriptDisplay =
-    fullTranscript.trim() ||
-    (isListening || isTranscribing ? liveTranscript : "");
+  const transcriptDisplay = (() => {
+    const base = fullTranscript.trim();
+    if (streamInterim) {
+      return base ? `${base} ${streamInterim}` : streamInterim;
+    }
+    return base || (isListening || isTranscribing ? liveTranscript : "");
+  })();
   const transcriptParts = splitTranscriptHighlight(
     fullTranscript.trim() ? fullTranscript : ""
   );
@@ -1309,12 +1758,39 @@ export default function App() {
               ))}
             </select>
           </div>
+          <div
+            className={`pp-status ${
+              ppConnected === true
+                ? "ok"
+                : ppConnected === false
+                ? "ko"
+                : "unknown"
+            }`}
+            title={
+              ppConnected === true
+                ? `ProPresenter connecté (${config.ip}:${config.port})`
+                : ppConnected === false
+                ? "ProPresenter injoignable"
+                : "État ProPresenter inconnu"
+            }
+          >
+            <span className="status-dot" />
+            PP
+          </div>
           {lastSent && (
             <div className="last-sent">
-              <span className="status-dot ok" />
-              Dernier envoi : <strong>{lastSent.ref}</strong>
+              Dernier : <strong>{lastSent.ref}</strong>
             </div>
           )}
+          <button
+            className="icon-btn hide-btn"
+            onClick={hideProPresenter}
+            disabled={hiding}
+            aria-label="Masquer le verset à l'écran"
+            title="Masquer le verset (Échap)"
+          >
+            {hiding ? "…" : "Masquer"}
+          </button>
           <button
             className="icon-btn"
             onClick={() => setShowConfig((v) => !v)}
@@ -1491,6 +1967,107 @@ export default function App() {
                   />
                 </div>
               </div>
+
+              <div className="stt-settings">
+                <label
+                  className={`stt-stream-toggle ${
+                    !streamingAvailable ? "is-disabled" : ""
+                  }`}
+                  title={
+                    streamingAvailable
+                      ? "Transcription en continu (Deepgram), plus rapide et précise"
+                      : "Nécessite une clé Deepgram (DEEPGRAM_API_KEY)"
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={Boolean(config.streaming) && streamingAvailable}
+                    disabled={!streamingAvailable || isListening}
+                    onChange={(e) =>
+                      setConfig({ ...config, streaming: e.target.checked })
+                    }
+                  />
+                  Temps réel (streaming)
+                  {config.streaming && streamingAvailable && (
+                    <span className="stt-stream-badge">LIVE</span>
+                  )}
+                </label>
+
+                {sttConfidence != null && isListening && (
+                  <span
+                    className={`stt-confidence ${
+                      sttConfidence >= 0.8
+                        ? "high"
+                        : sttConfidence >= 0.6
+                        ? "mid"
+                        : "low"
+                    }`}
+                    title="Confiance de la transcription"
+                  >
+                    {Math.round(sttConfidence * 100)}%
+                  </span>
+                )}
+
+                <div className="stt-gain-row">
+                  <span className="audio-controls-label">Gain</span>
+                  <input
+                    type="range"
+                    min="50"
+                    max="250"
+                    step="10"
+                    value={config.inputGain}
+                    onChange={(e) =>
+                      setConfig({ ...config, inputGain: Number(e.target.value) })
+                    }
+                  />
+                  <span className="stt-gain-val">{config.inputGain}%</span>
+                </div>
+
+                <div className="stt-dsp-row">
+                  <label title="Réduction de bruit du navigateur — à désactiver sur un feed propre de console">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(config.noiseSuppression)}
+                      disabled={isListening}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          noiseSuppression: e.target.checked,
+                        })
+                      }
+                    />
+                    Anti-bruit
+                  </label>
+                  <label title="Annulation d'écho — utile au micro laptop, à couper sur feed direct">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(config.echoCancellation)}
+                      disabled={isListening}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          echoCancellation: e.target.checked,
+                        })
+                      }
+                    />
+                    Anti-écho
+                  </label>
+                  <label title="Gain automatique du navigateur">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(config.autoGainControl)}
+                      disabled={isListening}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          autoGainControl: e.target.checked,
+                        })
+                      }
+                    />
+                    Gain auto
+                  </label>
+                </div>
+              </div>
             </div>
 
             <div className="live-transcript-box">
@@ -1512,9 +2089,17 @@ export default function App() {
                       <span className="live-transcript-last">
                         {transcriptParts.last || fullTranscript}
                       </span>
+                      {streamInterim && (
+                        <span className="live-transcript-pending">
+                          {" "}
+                          {streamInterim}
+                        </span>
+                      )}
                     </>
                   ) : (
-                    <span className="live-transcript-last">{liveTranscript}</span>
+                    <span className="live-transcript-last">
+                      {streamInterim || liveTranscript}
+                    </span>
                   )}
                 </p>
               ) : (
@@ -1527,9 +2112,11 @@ export default function App() {
               {speechSupported ? (
                 <>
                   {isListening
-                    ? isTranscribing
-                      ? `Écoute · ${pendingTranscriptions} transcription(s) en file`
-                      : `Écoute active · STT ${sttMode}`
+                    ? config.streaming && streamingAvailable
+                      ? "Écoute active · temps réel (Deepgram)"
+                      : isTranscribing
+                        ? `Écoute · ${pendingTranscriptions} transcription(s) en file`
+                        : `Écoute active · STT ${sttMode}`
                     : isTranscribing
                       ? `Finalisation (${pendingTranscriptions})...`
                       : `Dictée prête · STT ${sttMode}`}{" "}
@@ -1589,7 +2176,7 @@ export default function App() {
                       <button
                         className="icon-action"
                         title="Afficher"
-                        onClick={() => sendToProPresenter(verse)}
+                        onClick={() => requestSend(verse)}
                         disabled={sending === verse.reference}
                       >
                         ▶
@@ -1711,10 +2298,11 @@ export default function App() {
                 <div className="verse-actions row-actions">
                   <button
                     className="send-btn"
-                    onClick={() => sendToProPresenter(verse)}
+                    onClick={() => requestSend(verse)}
                     disabled={sending === verse.reference}
                   >
                     {sending === verse.reference ? "Envoi…" : "Afficher ▶"}
+                    {idx < 3 && <kbd className="send-kbd">{idx + 1}</kbd>}
                   </button>
                   <button
                     className="ghost-btn"
@@ -1777,7 +2365,7 @@ export default function App() {
                         <button
                           className="icon-action"
                           title="Afficher dans ProPresenter"
-                          onClick={() => sendToProPresenter(d.verse)}
+                          onClick={() => requestSend(d.verse)}
                           disabled={sending === d.verse.reference}
                         >
                           ▶
@@ -1801,13 +2389,164 @@ export default function App() {
             </div>
           </section>
         </div>
+
+        <section className="panel history-panel">
+          <div className="panel-head">
+            <span className="panel-hint">Historique des envois</span>
+            {history.length > 0 && (
+              <button
+                className="panel-link-btn"
+                type="button"
+                onClick={() => {
+                  setHistory([]);
+                  persistHistory([]);
+                }}
+              >
+                Effacer
+              </button>
+            )}
+          </div>
+          <div className="history-list">
+            {history.length === 0 ? (
+              <p className="panel-empty">
+                Les versets envoyés à ProPresenter pendant le service
+                apparaîtront ici.
+              </p>
+            ) : (
+              history.map((h) => (
+                <div key={h.id} className="history-item">
+                  <div className="history-main">
+                    <strong>{h.reference}</strong>
+                    <span className="history-snippet">
+                      {h.text.slice(0, 64)}
+                      {h.text.length > 64 ? "…" : ""}
+                    </span>
+                  </div>
+                  <div className="history-side">
+                    <span className="history-time">
+                      {formatDetectionTime(h.at)}
+                    </span>
+                    <button
+                      className="icon-action"
+                      title="Renvoyer"
+                      onClick={() =>
+                        requestSend({
+                          reference: h.reference,
+                          text: h.text,
+                          version: h.version,
+                        })
+                      }
+                    >
+                      ↻
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
       </main>
+
+      {preview && (
+        <div className="preview-overlay" onClick={() => setPreview(null)}>
+          <div className="preview-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="preview-head">
+              <div>
+                <h3 className="preview-ref">{preview.verse.reference}</h3>
+                {preview.verse.version && (
+                  <span className="preview-version">
+                    {preview.verse.version}
+                  </span>
+                )}
+              </div>
+              <button className="icon-btn" onClick={() => setPreview(null)}>
+                ✕
+              </button>
+            </div>
+
+            {preview.pages.length > 1 && (
+              <div className="preview-pages-bar">
+                <span>
+                  Verset long — {preview.pages.length} pages (≤{" "}
+                  {config.verseMaxChars} car.)
+                </span>
+                <div className="preview-pages-nav">
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    disabled={preview.pageIndex === 0}
+                    onClick={() =>
+                      setPreview((p) => ({
+                        ...p,
+                        pageIndex: Math.max(0, p.pageIndex - 1),
+                      }))
+                    }
+                  >
+                    ‹
+                  </button>
+                  <span className="preview-page-num">
+                    {preview.pageIndex + 1}/{preview.pages.length}
+                  </span>
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    disabled={preview.pageIndex >= preview.pages.length - 1}
+                    onClick={() =>
+                      setPreview((p) => ({
+                        ...p,
+                        pageIndex: Math.min(
+                          p.pages.length - 1,
+                          p.pageIndex + 1
+                        ),
+                      }))
+                    }
+                  >
+                    ›
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="preview-screen">
+              <p className="preview-text">
+                {preview.pages[preview.pageIndex] || preview.verse.text}
+              </p>
+            </div>
+
+            <div className="preview-actions">
+              <button
+                className="send-btn"
+                onClick={sendPreviewPage}
+                disabled={sending === preview.verse.reference}
+              >
+                {sending === preview.verse.reference
+                  ? "Envoi…"
+                  : preview.pages.length > 1
+                  ? `Afficher page ${preview.pageIndex + 1} ▶`
+                  : "Afficher ▶"}
+              </button>
+              <button
+                className="ghost-btn"
+                type="button"
+                onClick={() => setPreview(null)}
+              >
+                Fermer
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <footer className="footer">
         <span>VersePilot Live · MVP v1</span>
         <span className="footer-sep">·</span>
         <span>
           ProPresenter cible : <code>{config.ip}:{config.port}</code>
+        </span>
+        <span className="footer-sep">·</span>
+        <span className="footer-kbd">
+          <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> afficher · <kbd>Échap</kbd>{" "}
+          masquer
         </span>
       </footer>
     </div>
@@ -1843,6 +2582,16 @@ function ConfigPanel({
             }
           />
           <span>Deux messages séparés (référence + verset)</span>
+        </label>
+        <label className="config-toggle field-full">
+          <input
+            type="checkbox"
+            checked={Boolean(config.previewBeforeSend)}
+            onChange={(e) =>
+              setConfig({ ...config, previewBeforeSend: e.target.checked })
+            }
+          />
+          <span>Aperçu avant envoi (+ pagination des versets longs)</span>
         </label>
         <div className="config-grid">
           <Field
@@ -1918,7 +2667,18 @@ function ConfigPanel({
             onChange={(v) => setConfig({ ...config, textTokenName: v })}
             placeholder="Verset"
             mono
-            full
+          />
+          <Field
+            label="Longueur max / page"
+            value={config.verseMaxChars}
+            onChange={(v) =>
+              setConfig({
+                ...config,
+                verseMaxChars: v.replace(/[^0-9]/g, "") || "",
+              })
+            }
+            placeholder="220"
+            mono
           />
         </div>
         <div className="config-actions">

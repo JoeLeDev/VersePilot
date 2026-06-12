@@ -27,9 +27,19 @@ export function similarityToScore(sim, source = "semantic") {
   return Math.min(89, Math.max(35, Math.round(((clamped - 0.32) / 0.45) * 54 + 35)));
 }
 
-export function loadEmbeddingIndex(biblesDir, slug) {
-  const metaPath = path.join(biblesDir, `${slug}.embeddings.meta.json`);
-  const binPath = path.join(biblesDir, `${slug}.embeddings.bin`);
+/**
+ * Construit le suffixe de fichier d'index selon le fournisseur d'embeddings.
+ * - openai (défaut historique) : `${slug}.embeddings.*`
+ * - local                      : `${slug}.local.embeddings.*`
+ */
+export function embeddingVariantSuffix(variant) {
+  return variant && variant !== "openai" ? `.${variant}` : "";
+}
+
+export function loadEmbeddingIndex(biblesDir, slug, variant = "openai") {
+  const suffix = embeddingVariantSuffix(variant);
+  const metaPath = path.join(biblesDir, `${slug}${suffix}.embeddings.meta.json`);
+  const binPath = path.join(biblesDir, `${slug}${suffix}.embeddings.bin`);
   if (!fs.existsSync(metaPath) || !fs.existsSync(binPath)) {
     return null;
   }

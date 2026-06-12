@@ -10,6 +10,8 @@ import os from "os";
 import { fileURLToPath } from "url";
 import { promisify } from "util";
 import { execFile } from "child_process";
+import http from "http";
+import { WebSocketServer, WebSocket } from "ws";
 import OpenAI from "openai";
 import {
   verseKey,
@@ -34,6 +36,13 @@ const SEARCH_MODE = (process.env.SEARCH_MODE || "offline").toLowerCase();
 const SEMANTIC_SEARCH = (process.env.SEMANTIC_SEARCH || "openai").toLowerCase();
 const OPENAI_EMBEDDING_MODEL =
   process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
+// Fournisseur d'embeddings utilisé pour la recherche sémantique : "openai" ou "local".
+const EMBEDDING_PROVIDER = SEMANTIC_SEARCH === "local" ? "local" : "openai";
+const LOCAL_EMBED_URL = (
+  process.env.LOCAL_EMBED_URL || "http://127.0.0.1:8003"
+).replace(/\/$/, "");
+const LOCAL_EMBED_MODEL =
+  process.env.LOCAL_EMBED_MODEL || "intfloat/multilingual-e5-small";
 const STT_MODE = (process.env.STT_MODE || "local").toLowerCase();
 const MLX_STT_URL = (process.env.MLX_STT_URL || "http://127.0.0.1:8002").replace(
   /\/$/,
@@ -43,6 +52,24 @@ const MLX_STT_LANG = process.env.MLX_STT_LANG || "fr";
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
 const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "nova-3";
 const DEEPGRAM_LANGUAGE = process.env.DEEPGRAM_LANGUAGE || "fr";
+// ATTENTION : nova-3 n'accepte PAS `keywords` (supprimé) et `keyterm` est
+// réservé à l'anglais → activer ce boost en fr/nova-3 fait échouer Deepgram (400).
+// Désactivé par défaut ; à n'activer que sur nova-2 ou un modèle anglais.
+const DEEPGRAM_KEYWORDS_ENABLED =
+  (process.env.DEEPGRAM_KEYWORDS_ENABLED || "false").toLowerCase() === "true";
+// Termes prioritaires pour booster la reconnaissance des références bibliques.
+const DEEPGRAM_BIBLE_KEYTERMS = [
+  "Genèse", "Exode", "Lévitique", "Nombres", "Deutéronome", "Josué", "Juges",
+  "Ruth", "Samuel", "Rois", "Chroniques", "Esdras", "Néhémie", "Esther",
+  "Job", "Psaumes", "Proverbes", "Ecclésiaste", "Cantique", "Ésaïe",
+  "Jérémie", "Lamentations", "Ézéchiel", "Daniel", "Osée", "Joël", "Amos",
+  "Abdias", "Jonas", "Michée", "Nahum", "Habacuc", "Sophonie", "Aggée",
+  "Zacharie", "Malachie", "Matthieu", "Marc", "Luc", "Jean", "Actes",
+  "Romains", "Corinthiens", "Galates", "Éphésiens", "Philippiens",
+  "Colossiens", "Thessaloniciens", "Timothée", "Tite", "Philémon", "Hébreux",
+  "Jacques", "Pierre", "Jude", "Apocalypse", "chapitre", "verset",
+];
+const STREAMING_AVAILABLE = Boolean(DEEPGRAM_API_KEY);
 const OPENAI_TRANSCRIBE_MODEL =
   process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
 const WHISPER_MODE = (process.env.WHISPER_MODE || "local").toLowerCase();
@@ -222,16 +249,23 @@ function loadBible(slug = DEFAULT_BIBLE_SLUG) {
     rebuildSearchIndex();
     WHISPER_CPP_PROMPT = buildWhisperCppPrompt();
     embeddingIndex = null;
-    if (SEMANTIC_SEARCH !== "off" && process.env.OPENAI_API_KEY) {
+    const semanticReady =
+      SEMANTIC_SEARCH !== "off" &&
+      (EMBEDDING_PROVIDER === "local" || Boolean(process.env.OPENAI_API_KEY));
+    if (semanticReady) {
       try {
-        embeddingIndex = loadEmbeddingIndex(BIBLES_DIR, slug);
+        embeddingIndex = loadEmbeddingIndex(BIBLES_DIR, slug, EMBEDDING_PROVIDER);
         if (embeddingIndex) {
           console.log(
-            `🔍 Index sémantique: ${embeddingIndex.count} versets (${embeddingIndex.model})`
+            `🔍 Index sémantique [${EMBEDDING_PROVIDER}]: ${embeddingIndex.count} versets (${embeddingIndex.model})`
           );
         } else {
+          const cmd =
+            EMBEDDING_PROVIDER === "local"
+              ? "npm run build-embeddings:local"
+              : "npm run build-embeddings";
           console.warn(
-            `⚠️  Pas d'index sémantique pour ${slug}. Lance: npm run build-embeddings`
+            `⚠️  Pas d'index sémantique [${EMBEDDING_PROVIDER}] pour ${slug}. Lance: ${cmd}`
           );
         }
       } catch (err) {
@@ -601,16 +635,46 @@ function mergeLexicalPriority(lexical, semantic, max) {
   return [...byRef.values()].sort(compareSearchResults).slice(0, max);
 }
 
+/** Embedding local (sentence-transformers) via le serveur Python. */
+async function embedWithLocalServer(texts, type = "query") {
+  const r = await fetch(`${LOCAL_EMBED_URL}/embed`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ texts, type }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => "");
+    throw new Error(`Serveur embeddings local ${r.status}: ${detail.slice(0, 200)}`);
+  }
+  const data = await r.json();
+  return data.embeddings || [];
+}
+
+/** Calcule l'embedding d'une requête selon le fournisseur actif. */
+async function embedQuery(text) {
+  const input = text.slice(0, 2000);
+  if (EMBEDDING_PROVIDER === "local") {
+    const [vec] = await embedWithLocalServer([input], "query");
+    if (!vec) throw new Error("Serveur embeddings local: réponse vide.");
+    return Float32Array.from(vec);
+  }
+  if (!openai) {
+    throw new Error("OPENAI_API_KEY manquant pour les embeddings OpenAI.");
+  }
+  const embRes = await openai.embeddings.create({
+    model: OPENAI_EMBEDDING_MODEL,
+    input,
+  });
+  return Float32Array.from(embRes.data[0].embedding);
+}
+
 async function searchSemantic(query, max = 5) {
-  if (!embeddingIndex || !openai || SEMANTIC_SEARCH === "off") {
+  if (!embeddingIndex || SEMANTIC_SEARCH === "off") {
     return [];
   }
 
-  const embRes = await openai.embeddings.create({
-    model: OPENAI_EMBEDDING_MODEL,
-    input: query.slice(0, 2000),
-  });
-  const qVec = Float32Array.from(embRes.data[0].embedding);
+  const qVec = await embedQuery(query);
   const { count, dimensions, vectors } = embeddingIndex;
   const scored = [];
 
@@ -1260,9 +1324,14 @@ app.post("/bible/select", (req, res) => {
       verseCount: VERSES.length,
       embeddingIndexReady: Boolean(embeddingIndex),
       semanticSearchEnabled: SEMANTIC_SEARCH !== "off",
+      embeddingProvider: EMBEDDING_PROVIDER,
       embeddingHint: embeddingIndex
         ? null
-        : "Index sémantique absent pour cette version. Lance: npm run build-embeddings",
+        : `Index sémantique [${EMBEDDING_PROVIDER}] absent pour cette version. Lance: ${
+            EMBEDDING_PROVIDER === "local"
+              ? "npm run build-embeddings:local"
+              : "npm run build-embeddings"
+          }`,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message || "Changement de bible impossible." });
@@ -1522,6 +1591,11 @@ async function transcribeWithDeepgram(audioBuffer) {
     smart_format: "true",
     diarize: "false",
   });
+  if (DEEPGRAM_KEYWORDS_ENABLED) {
+    for (const term of DEEPGRAM_BIBLE_KEYTERMS) {
+      params.append("keywords", `${term}:2`);
+    }
+  }
 
   const r = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
     method: "POST",
@@ -1769,6 +1843,75 @@ app.get("/propresenter/messages", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /propresenter/clear
+// Body: { ip, port, messageId?, messageName?, all? }
+// Masque un message précis, ou toute la couche "messages" si all=true.
+// ---------------------------------------------------------------------------
+app.post("/propresenter/clear", async (req, res) => {
+  try {
+    const { ip, port, messageId, messageName, all = false } = req.body || {};
+    if (!ip || !port) {
+      return res.status(400).json({ error: "Champs requis : ip, port." });
+    }
+
+    const baseUrl = buildProPresenterBaseUrl(ip, port);
+
+    if (all || (!messageId && !messageName)) {
+      const url = `${baseUrl}/v1/clear/layer/messages`;
+      const ppResponse = await fetch(url);
+      const { bodyText } = await readResponseBody(ppResponse);
+      if (!ppResponse.ok) {
+        return res.status(502).json({
+          error: `ProPresenter a répondu ${ppResponse.status}`,
+          details: bodyText,
+          url,
+        });
+      }
+      return res.json({ ok: true, mode: "layer", url });
+    }
+
+    let resolved;
+    try {
+      resolved = await resolveMessageByName(baseUrl, messageName, messageId);
+    } catch (err) {
+      if (err.availableMessages) {
+        return res.status(404).json({
+          error: err.message,
+          availableMessages: err.availableMessages,
+        });
+      }
+      throw err;
+    }
+
+    const url = `${baseUrl}/v1/message/${encodeURIComponent(
+      String(resolved.id)
+    )}/clear`;
+    const ppResponse = await fetch(url);
+    const { bodyText } = await readResponseBody(ppResponse);
+    if (!ppResponse.ok) {
+      return res.status(502).json({
+        error: `ProPresenter a répondu ${ppResponse.status}`,
+        details: bodyText,
+        url,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      mode: "message",
+      messageId: resolved.id,
+      messageName: resolved.name,
+      url,
+    });
+  } catch (err) {
+    console.error("propresenter/clear error:", err);
+    return res
+      .status(500)
+      .json({ error: err.message || "Masquage ProPresenter impossible." });
+  }
+});
+
 // Health check
 app.get("/health", async (req, res) => {
   const mlxProbe = await probeMlxStt();
@@ -1781,11 +1924,16 @@ app.get("/health", async (req, res) => {
     searchMode: SEARCH_MODE,
     semanticSearch: SEMANTIC_SEARCH,
     embeddingIndexReady: Boolean(embeddingIndex),
-    embeddingModel: OPENAI_EMBEDDING_MODEL,
+    embeddingProvider: EMBEDDING_PROVIDER,
+    embeddingModel:
+      EMBEDDING_PROVIDER === "local" ? LOCAL_EMBED_MODEL : OPENAI_EMBEDDING_MODEL,
+    localEmbedUrl: LOCAL_EMBED_URL,
     sttMode: STT_MODE,
     deepgramConfigured: Boolean(DEEPGRAM_API_KEY),
     deepgramModel: DEEPGRAM_MODEL,
     deepgramLanguage: DEEPGRAM_LANGUAGE,
+    streamingAvailable: STREAMING_AVAILABLE,
+    deepgramKeywords: DEEPGRAM_KEYWORDS_ENABLED,
     mlxSttUrl: MLX_STT_URL,
     mlxSttAvailable: mlxProbe.ok,
     mlxSttModelLoaded: mlxProbe.modelLoaded ?? false,
@@ -1817,6 +1965,155 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
-app.listen(PORT, () => {
+// ---------------------------------------------------------------------------
+// Streaming STT : relais WebSocket navigateur <-> Deepgram Listen (live).
+// Le navigateur envoie du PCM 16 bits / 16 kHz mono ; on relaie tel quel.
+// ---------------------------------------------------------------------------
+function buildDeepgramStreamUrl(sampleRate = 16000) {
+  const params = new URLSearchParams({
+    model: DEEPGRAM_MODEL,
+    language: DEEPGRAM_LANGUAGE,
+    encoding: "linear16",
+    sample_rate: String(sampleRate),
+    channels: "1",
+    interim_results: "true",
+    smart_format: "true",
+    punctuate: "true",
+    endpointing: "300",
+    vad_events: "true",
+  });
+  if (DEEPGRAM_KEYWORDS_ENABLED) {
+    for (const term of DEEPGRAM_BIBLE_KEYTERMS) {
+      params.append("keywords", `${term}:2`);
+    }
+  }
+  return `wss://api.deepgram.com/v1/listen?${params}`;
+}
+
+function attachSttStream(server) {
+  const wss = new WebSocketServer({ server, path: "/stt/stream" });
+
+  wss.on("connection", (client, req) => {
+    if (!DEEPGRAM_API_KEY) {
+      client.send(
+        JSON.stringify({
+          type: "error",
+          error: "DEEPGRAM_API_KEY manquant : streaming indisponible.",
+        })
+      );
+      client.close();
+      return;
+    }
+
+    const url = new URL(req.url, "http://localhost");
+    const sampleRate = Number(url.searchParams.get("sampleRate")) || 16000;
+
+    const dg = new WebSocket(buildDeepgramStreamUrl(sampleRate), {
+      headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
+    });
+
+    let dgOpen = false;
+    const audioBacklog = [];
+    let keepAlive = null;
+
+    dg.on("open", () => {
+      dgOpen = true;
+      for (const buf of audioBacklog) dg.send(buf);
+      audioBacklog.length = 0;
+      keepAlive = setInterval(() => {
+        if (dg.readyState === WebSocket.OPEN) {
+          dg.send(JSON.stringify({ type: "KeepAlive" }));
+        }
+      }, 8000);
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "ready" }));
+      }
+    });
+
+    dg.on("message", (raw) => {
+      let data = null;
+      try {
+        data = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+      if (data.type === "Results") {
+        const alt = data.channel?.alternatives?.[0];
+        const text = (alt?.transcript || "").trim();
+        if (!text) return;
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(
+            JSON.stringify({
+              type: "transcript",
+              text,
+              isFinal: Boolean(data.is_final),
+              speechFinal: Boolean(data.speech_final),
+              confidence: alt?.confidence ?? null,
+            })
+          );
+        }
+      }
+    });
+
+    dg.on("error", (err) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({ type: "error", error: `Deepgram: ${err.message}` })
+        );
+      }
+    });
+
+    dg.on("close", () => {
+      if (keepAlive) clearInterval(keepAlive);
+      if (client.readyState === WebSocket.OPEN) client.close();
+    });
+
+    client.on("message", (data, isBinary) => {
+      if (isBinary) {
+        if (dgOpen && dg.readyState === WebSocket.OPEN) {
+          dg.send(data);
+        } else {
+          audioBacklog.push(data);
+        }
+        return;
+      }
+      // Message texte de contrôle (ex: finalize/close).
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "CloseStream" && dg.readyState === WebSocket.OPEN) {
+          dg.send(JSON.stringify({ type: "CloseStream" }));
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+
+    client.on("close", () => {
+      if (keepAlive) clearInterval(keepAlive);
+      if (dg.readyState === WebSocket.OPEN) {
+        try {
+          dg.send(JSON.stringify({ type: "CloseStream" }));
+        } catch {
+          /* ignore */
+        }
+      }
+      dg.close();
+    });
+
+    client.on("error", () => {
+      if (keepAlive) clearInterval(keepAlive);
+      dg.close();
+    });
+  });
+
+  console.log("🔌 STT streaming WebSocket prêt sur /stt/stream");
+}
+
+const httpServer = http.createServer(app);
+attachSttStream(httpServer);
+httpServer.listen(PORT, () => {
   console.log(`✅ VersePilot Live backend ready on http://localhost:${PORT}`);
+  if (STREAMING_AVAILABLE) {
+    console.log("🎧 Streaming Deepgram disponible (mode temps réel).");
+  }
 });
