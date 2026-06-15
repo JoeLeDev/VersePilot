@@ -25,11 +25,18 @@ import {
   applyBiblicalLexicon,
   getLexiconStats,
 } from "./lib/biblical-lexicon.js";
-
-dotenv.config();
+import {
+  getLicenseConfig,
+  isDeepgramAvailable,
+  proxyWsUrl,
+} from "./lib/versepilot-license.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const envFile =
+  process.env.VERSEPILOT_ENV_FILE || path.join(__dirname, ".env");
+dotenv.config({ path: envFile });
 
 const app = express();
 app.use(cors());
@@ -54,6 +61,7 @@ const MLX_STT_URL = (process.env.MLX_STT_URL || "http://127.0.0.1:8002").replace
 );
 const MLX_STT_LANG = process.env.MLX_STT_LANG || "fr";
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
+const LICENSE_CONFIG = getLicenseConfig();
 const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "nova-3";
 const DEEPGRAM_LANGUAGE = process.env.DEEPGRAM_LANGUAGE || "fr";
 // ATTENTION : nova-3 n'accepte PAS `keywords` (supprimé) et `keyterm` est
@@ -73,7 +81,9 @@ const DEEPGRAM_BIBLE_KEYTERMS = [
   "Colossiens", "Thessaloniciens", "Timothée", "Tite", "Philémon", "Hébreux",
   "Jacques", "Pierre", "Jude", "Apocalypse", "chapitre", "verset",
 ];
-const STREAMING_AVAILABLE = Boolean(DEEPGRAM_API_KEY);
+const STREAMING_AVAILABLE =
+  isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG) &&
+  (STT_MODE === "deepgram" || STT_MODE === "hybrid");
 const OPENAI_TRANSCRIBE_MODEL =
   process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
 const WHISPER_MODE = (process.env.WHISPER_MODE || "local").toLowerCase();
@@ -1836,9 +1846,26 @@ app.post("/send-to-propresenter", async (req, res) => {
 });
 
 async function transcribeWithDeepgram(audioBuffer) {
+  if (LICENSE_CONFIG.enabled) {
+    const r = await fetch(`${LICENSE_CONFIG.proxyUrl}/v1/transcribe`, {
+      method: "POST",
+      headers: {
+        "X-VersePilot-License": LICENSE_CONFIG.licenseKey,
+        "Content-Type": "audio/wav",
+      },
+      body: audioBuffer,
+      signal: AbortSignal.timeout(25000),
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok) {
+      throw new Error(data?.error || `Proxy licence HTTP ${r.status}`);
+    }
+    return String(data?.transcript || "").trim();
+  }
+
   if (!DEEPGRAM_API_KEY) {
     throw new Error(
-      "DEEPGRAM_API_KEY manquant. Ajoute-le dans backend/.env puis redémarre le backend."
+      "DEEPGRAM_API_KEY manquant. Configure DEEPGRAM_API_KEY ou VERSEPILOT_LICENSE_KEY + VERSEPILOT_PROXY_URL."
     );
   }
 
@@ -1936,7 +1963,7 @@ async function transcribeAudio(audioBuffer, mode = STT_MODE) {
   }
 
   if (mode === "hybrid") {
-    if (DEEPGRAM_API_KEY) {
+    if (isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG)) {
       try {
         return {
           text: await transcribeWithDeepgram(audioBuffer),
@@ -2187,7 +2214,10 @@ app.get("/health", async (req, res) => {
       EMBEDDING_PROVIDER === "local" ? LOCAL_EMBED_MODEL : OPENAI_EMBEDDING_MODEL,
     localEmbedUrl: LOCAL_EMBED_URL,
     sttMode: STT_MODE,
-    deepgramConfigured: Boolean(DEEPGRAM_API_KEY),
+    deepgramConfigured: isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG),
+    licenseMode: LICENSE_CONFIG.enabled,
+    licenseConfigured: Boolean(LICENSE_CONFIG.licenseKey),
+    proxyUrl: LICENSE_CONFIG.proxyUrl || null,
     deepgramModel: DEEPGRAM_MODEL,
     deepgramLanguage: DEEPGRAM_LANGUAGE,
     streamingAvailable: STREAMING_AVAILABLE,
@@ -2200,7 +2230,7 @@ app.get("/health", async (req, res) => {
     openAIConfigured: Boolean(process.env.OPENAI_API_KEY),
     biblicalLexicon: getLexiconStats(),
     sttCloudReady:
-      Boolean(DEEPGRAM_API_KEY) ||
+      isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG) ||
       (Boolean(process.env.OPENAI_API_KEY) && STT_MODE !== "local"),
     whisperConfigured:
       WHISPER_MODE === "local" &&
@@ -2253,11 +2283,12 @@ function attachSttStream(server) {
   const wss = new WebSocketServer({ server, path: "/stt/stream" });
 
   wss.on("connection", (client, req) => {
-    if (!DEEPGRAM_API_KEY) {
+    if (!isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG)) {
       client.send(
         JSON.stringify({
           type: "error",
-          error: "DEEPGRAM_API_KEY manquant : streaming indisponible.",
+          error:
+            "STT cloud indisponible : configure DEEPGRAM_API_KEY ou VERSEPILOT_LICENSE_KEY + VERSEPILOT_PROXY_URL.",
         })
       );
       client.close();
@@ -2267,9 +2298,14 @@ function attachSttStream(server) {
     const url = new URL(req.url, "http://localhost");
     const sampleRate = Number(url.searchParams.get("sampleRate")) || 16000;
 
-    const dg = new WebSocket(buildDeepgramStreamUrl(sampleRate), {
-      headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
-    });
+    const upstreamUrl = LICENSE_CONFIG.enabled
+      ? `${proxyWsUrl(LICENSE_CONFIG.proxyUrl)}?sampleRate=${sampleRate}`
+      : buildDeepgramStreamUrl(sampleRate);
+    const upstreamHeaders = LICENSE_CONFIG.enabled
+      ? { "X-VersePilot-License": LICENSE_CONFIG.licenseKey }
+      : { Authorization: `Token ${DEEPGRAM_API_KEY}` };
+
+    const dg = new WebSocket(upstreamUrl, { headers: upstreamHeaders });
 
     let dgOpen = false;
     const audioBacklog = [];

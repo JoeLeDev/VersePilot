@@ -19,54 +19,250 @@ versepilot-live/
 
 ## Prérequis
 
-- Node.js 18+ (pour `fetch` natif et `--watch`)
-- Clé API OpenAI uniquement si `SEARCH_MODE=ai` ou `hybrid` avec fallback
-- ProPresenter 7 avec le **Network → Enable Network** activé (par défaut port `50001`)
-- (Option voix offline) `whisper.cpp` installe localement + un modele `.bin`
+| Outil | Version | Notes |
+|-------|---------|--------|
+| **Node.js** | 18+ (20 LTS recommandé) | `node -v` et `npm -v` |
+| **Git** | récent | pour cloner le dépôt |
+| **ProPresenter 7+** | réseau activé | port par défaut `50001` (le tien peut être `49354`) |
 
-## Installation
+**Optionnel selon usage :**
+- Clé **OpenAI** — seulement si `SEARCH_MODE=ai` ou `hybrid`
+- Clé **Deepgram** — transcription temps réel (`STT_MODE=deepgram`)
+- **Python 3** + MLX — Apple Silicon uniquement (`npm run mlx-stt`)
+- **whisper.cpp** — transcription 100 % locale (`STT_MODE=local`)
 
-### 0. Mode desktop (Electron)
+> **macOS** : Electron + son système fonctionnent mieux dans la fenêtre desktop.  
+> **Windows / Linux** : l’app tourne, mais le **son système** pour la capture n’est pas garanti (utilise le micro).
 
-Depuis la racine du projet :
+---
+
+## Installation (nouvelle machine)
+
+### Étape 1 — Installation automatique (recommandé)
+
+À la **racine** du projet, **une seule commande** :
+
+```bash
+git clone <url-du-repo> versepilot-live
+cd versepilot-live
+
+npm run bootstrap
+```
+
+Ce script enchaîne :
+- `npm install` (racine + backend + frontend)
+- réparation du binaire **Electron** (`electron:fix`)
+- création de `backend/.env` depuis `.env.example` si absent
+- génération du lexique STT si besoin
+
+**Avec les bibles** (15 versions, plusieurs minutes — réseau requis) :
+
+```bash
+npm run bootstrap:full
+```
+
+Vérification Electron :
+
+```bash
+npx electron --version
+```
+
+### Étape 1 bis — Installation manuelle
+
+Si tu préfères faire étape par étape :
 
 ```bash
 npm install
+npm run setup
+npm run electron:fix
+cp backend/.env.example backend/.env
 ```
 
-Puis installer les dépendances de chaque app :
+### Étape 2 — Configurer le backend
 
 ```bash
-cd backend && npm install
-cd ../frontend && npm install
+cp backend/.env.example backend/.env
+```
+
+Édite `backend/.env` au minimum :
+
+```bash
+PORT=4000
+SEARCH_MODE=offline
+STT_MODE=deepgram          # ou local / mlx sur Mac Apple Silicon
+DEEPGRAM_API_KEY=          # si STT_MODE=deepgram
+BIBLE_VERSION=louis-segond
+```
+
+### Étape 3 — Données bibliques (recommandé)
+
+Les gros fichiers JSON **ne sont pas dans Git**. Sur chaque machine :
+
+```bash
+cd backend
+npm run import-bibles       # ~15 versions FR/EN (quelques minutes)
+npm run build-lexicon       # lexique STT (déjà généré si biblical-lexicon.json présent)
 cd ..
 ```
 
-Lancer l'application desktop en mode dev :
+### Étape 4 — Lancer l’application
+
+**Mode desktop (recommandé en régie)** — depuis la racine :
 
 ```bash
 npm run dev
 ```
 
-Construire une app macOS (`.dmg`) :
+Cela démarre en parallèle :
+1. Backend → `http://localhost:4000`
+2. Frontend Vite → `http://localhost:5173`
+3. Fenêtre **Electron** (ne pas utiliser seulement l’onglet Chrome)
+
+**Mode navigateur seul** (sans Electron) — deux terminaux :
 
 ```bash
-npm run dist:mac
+# Terminal 1
+cd backend && npm run dev
+
+# Terminal 2
+cd frontend && npm run dev
 ```
 
-### 1. Backend
+Puis ouvre `http://localhost:5173` — **micro uniquement**, pas le son système ProPresenter.
+
+### Étape 5 — Build installable (optionnel)
+
+```bash
+# macOS (.dmg)
+npm run dist:mac
+
+# Windows (.exe) — lancer sur une machine Windows
+npm run dist:win
+```
+
+Le fichier sort dans `dist/`.
+
+---
+
+## Dépannage installation Electron
+
+### `Electron failed to install correctly, please delete node_modules/electron and try installing again`
+
+Message typique quand le **binaire Electron** (~100 Mo) n’a pas fini de se télécharger (réseau coupé, antivirus, `npm install` interrompu).
+
+**À la racine du projet** :
+
+```bash
+# 1. Nettoyer uniquement Electron (plus rapide)
+rm -rf node_modules/electron
+
+# 2. Retélécharger le binaire
+npm install
+npm run electron:fix
+
+# 3. Vérifier
+npx electron --version
+```
+
+Si ça échoue encore, **réinstall complète** :
+
+```bash
+rm -rf node_modules package-lock.json
+npm cache clean --force
+npm install
+npm run setup
+npm run electron:fix
+npx electron --version
+```
+
+**Réseau lent / proxy / pare-feu** :
+
+```bash
+export ELECTRON_GET_USE_PROXY=1
+npm install
+npm run electron:fix
+```
+
+**Windows (PowerShell)** — remplacer `rm -rf` par :
+
+```powershell
+Remove-Item -Recurse -Force node_modules\electron
+npm install
+npm run electron:fix
+```
+
+**Node.js** : utilise la **v20 LTS** ou **v22 LTS** ([nodejs.org](https://nodejs.org)). Les versions très récentes (ex. v25) peuvent parfois poser problème avec les scripts d’install.
+
+### `electron: command not found` ou pas de fenêtre au `npm run dev`
+
+```bash
+# À la racine du projet (pas dans backend/)
+rm -rf node_modules package-lock.json
+npm install
+npx electron --version
+```
+
+### Erreur réseau au téléchargement d’Electron (`ECONNRESET`, `ETIMEDOUT`)
+
+Electron télécharge un binaire (~80–150 Mo) au premier `npm install`.
+
+```bash
+# Réessayer avec cache propre
+npm cache clean --force
+npm install
+
+# Si proxy d’entreprise / réseau lent :
+export ELECTRON_GET_USE_PROXY=1
+npm install
+```
+
+### `npm run dev` : backend OK mais pas de fenêtre
+
+- Attendre que **4000** et **5173** répondent (le script utilise `wait-on`).
+- Vérifier qu’aucun autre process n’occupe ces ports.
+- Lancer manuellement : `npx electron .` (à la racine, avec backend + frontend déjà up).
+
+### Windows : échec `npm install` à la racine
+
+- Node **64 bits** (pas 32 bits) : [https://nodejs.org](https://nodejs.org)
+- Terminal **PowerShell ou CMD en administrateur** si erreur de permissions.
+- Antivirus : parfois bloque le binaire Electron — autoriser le dossier du projet.
+
+### Linux
+
+Non testé officiellement. Prérequis usuels pour Electron :
+
+```bash
+sudo apt install libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils
+```
+
+### Checklist rapide nouvelle machine
+
+```
+[ ] node -v  → 18+ (20 LTS idéal)
+[ ] npm run bootstrap
+[ ] npx electron --version  → OK
+[ ] éditer backend/.env
+[ ] npm run import-bibles  (si pas bootstrap:full)
+[ ] npm run dev
+```
+
+---
+
+## Installation (détail par composant)
+
+### Backend seul
 
 ```bash
 cd backend
 npm install
 cp .env.example .env
-# Édite .env et ajoute ta clé OPENAI_API_KEY
 npm run dev
 ```
 
-Le backend tourne sur `http://localhost:4000`.
+→ `http://localhost:4000`
 
-### 2. Frontend
+### Frontend seul
 
 ```bash
 cd frontend
@@ -74,7 +270,7 @@ npm install
 npm run dev
 ```
 
-Ouvre `http://localhost:5173`. Le proxy Vite redirige automatiquement les appels vers le backend.
+→ `http://localhost:5173` (proxy API vers `:4000`)
 
 ## Configuration ProPresenter
 
@@ -86,9 +282,11 @@ Le bouton ⚙ dans la barre du haut ouvre la configuration. Par défaut :
 | Port | `50001` |
 | Nom du Message | `Verset` |
 | Token référence | `Reference` |
-| Token texte | `Texte` |
+| Token texte | `Verset` |
 
-**Dans ProPresenter**, créer un **Message** nommé `Verset` qui contient deux tokens texte : `Reference` et `Texte`. La mise en page (police, taille, placement) se gère côté ProPresenter — VersePilot ne fait que pousser les valeurs.
+**Mode deux messages** (référence et verset sur des calques séparés) : créer dans ProPresenter un message `Reference` (jeton `Reference`, thème petit) et un message `Verset` (jeton `Verset` uniquement, thème grand). Activer « Deux messages séparés » dans ⚙ VersePilot.
+
+**Mode message unique** : un seul message `Verset` avec les jetons `Reference` et `Verset`.
 
 > Préférences > Network > **Enable Network** doit être coché.
 
@@ -211,12 +409,58 @@ Notes:
   "messageId": "optional-uuid",
   "messageName": "Verset",
   "refTokenName": "Reference",
-  "textTokenName": "Texte",
+  "textTokenName": "Verset",
   "reference": "Jean 3:16",
   "text": "Car Dieu a tant aimé le monde..."
 }
 ```
 → Déclenche le Message ProPresenter avec les valeurs fournies.
+
+## Livraison client (application locale + abonnement STT)
+
+Pour préparer un **installeur** à remettre au client :
+
+```bash
+npm run release:mac    # .dmg macOS (non signé)
+npm run release:win    # installeur Windows NSIS
+npm run release:dir    # dossier .app / test rapide
+```
+
+### Avant livraison — configurer la licence client
+
+1. Éditer `delivery/default.env` :
+   ```bash
+   STT_MODE=deepgram
+   VERSEPILOT_LICENSE_KEY=VP-EGLISE-2026-XXXX
+   VERSEPILOT_PROXY_URL=https://api.versepilot.tondomaine.fr
+   DEEPGRAM_API_KEY=
+   ```
+2. Ajouter la même clé dans `services/license-proxy/licenses.json` sur ton serveur.
+3. Rebuild : `npm run release:mac`
+
+**1er client (rapide)** : tu peux mettre `DEEPGRAM_API_KEY` directement dans le `.env` client sans proxy.
+
+### Proxy d'abonnement (multi-clients)
+
+```bash
+cd services/license-proxy
+cp .env.example .env && cp licenses.example.json licenses.json
+npm install && npm start
+```
+
+Voir `services/license-proxy/README.md` pour le déploiement VPS, quotas et désactivation impayés.
+
+### Documents à joindre au client
+
+| Fichier | Description |
+|---------|-------------|
+| `delivery/docs/GUIDE-INSTALLATION.md` | Installation |
+| `delivery/docs/GUIDE-ABONNEMENT.md` | Abonnement dictée incluse |
+| `delivery/docs/GUIDE-PROPRESENTER.md` | ProPresenter |
+
+**macOS non signé** : clic droit → Ouvrir la première fois.
+
+Voir `delivery/docs/CHECKLIST-LIVRAISON.md` pour la checklist complète.
 
 ## Garde-fou
 
@@ -231,4 +475,3 @@ Aucun envoi vers ProPresenter ne se déclenche automatiquement. Le bouton **"Aff
 - Raccourcis clavier `1` / `2` / `3` pour envoyer le résultat correspondant
 - Aperçu plein écran du verset avant envoi
 - Multi-cible : envoyer sur plusieurs instances ProPresenter (audience + stage display)
-# VersePilot

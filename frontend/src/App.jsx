@@ -1010,9 +1010,9 @@ export default function App() {
         live: live || undefined,
       }),
       signal,
-    });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.error || "Erreur de recherche.");
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Erreur de recherche.");
     return {
       suggestions: data.suggestions || [],
       mode: data.mode || "offline",
@@ -1166,7 +1166,7 @@ export default function App() {
     } finally {
       if (searchAbortRef.current === controller) {
         searchAbortRef.current = null;
-        setLoading(false);
+      setLoading(false);
       }
     }
   }
@@ -3061,7 +3061,7 @@ export default function App() {
 
             {preview.pages.length > 1 && (
               <div className="preview-pages-bar">
-                <span>
+        <span>
                   Verset long — {preview.pages.length} pages (≤{" "}
                   {config.verseMaxChars} car.)
                 </span>
@@ -3203,7 +3203,7 @@ function ConfigPanel({
           />
           {config.dualMessages ? (
             <>
-              <Field
+          <Field
                 label="Message référence"
                 value={config.refMessageName}
                 onChange={(v) => setConfig({ ...config, refMessageName: v })}
@@ -3218,10 +3218,10 @@ function ConfigPanel({
               />
               <Field
                 label="Message verset"
-                value={config.messageName}
-                onChange={(v) => setConfig({ ...config, messageName: v })}
-                placeholder="Verset"
-              />
+            value={config.messageName}
+            onChange={(v) => setConfig({ ...config, messageName: v })}
+            placeholder="Verset"
+          />
               <Field
                 label="ID message verset (opt.)"
                 value={config.messageId}

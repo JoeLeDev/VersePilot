@@ -3,9 +3,16 @@
   "version": "1.1.0",
   "private": true,
   "description": "VersePilot Live desktop app (Electron + React + Node backend)",
+  "engines": {
+    "node": ">=18"
+  },
   "main": "electron/main.js",
   "scripts": {
+    "bootstrap": "node scripts/setup.mjs",
+    "bootstrap:full": "node scripts/setup.mjs --with-bibles",
     "setup": "npm install --prefix backend && npm install --prefix frontend",
+    "electron:fix": "node node_modules/electron/install.js",
+    "reinstall": "npm run setup",
     "dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\" \"npm run dev:electron\"",
     "dev:with-mlx": "concurrently -k \"npm run mlx-stt --prefix backend\" \"npm run dev:backend\" \"npm run dev:frontend\" \"npm run dev:electron\"",
     "mlx-stt": "npm run mlx-stt --prefix backend",
@@ -16,9 +23,15 @@
     "fix-book-names": "npm run fix-book-names --prefix backend --",
     "build-embeddings": "npm run build-embeddings --prefix backend --",
     "build:frontend": "npm run build --prefix frontend",
-    "dist": "npm run setup && npm run build:frontend && electron-builder --mac --dir",
-    "dist:mac": "npm run setup && npm run build:frontend && electron-builder --mac dmg",
-    "dist:win": "npm run setup && npm run build:frontend && electron-builder --win nsis"
+    "release": "node scripts/release.mjs",
+    "release:mac": "node scripts/release.mjs --mac",
+    "release:win": "node scripts/release.mjs --win",
+    "release:dir": "node scripts/release.mjs --dir",
+    "license-proxy": "npm start --prefix services/license-proxy",
+    "license-proxy:dev": "npm run dev --prefix services/license-proxy",
+    "dist": "npm run release:dir",
+    "dist:mac": "npm run release:mac",
+    "dist:win": "npm run release:win"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
@@ -31,27 +44,60 @@
     "productName": "VersePilot Live",
     "asar": true,
     "asarUnpack": [
-      "backend/**"
+      "backend/**/*"
     ],
     "files": [
       "electron/**/*",
       "frontend/dist/**/*",
-      "backend/**/*",
+      {
+        "from": "backend",
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!**/.env",
+          "!**/.env.*",
+          "!**/models/**"
+        ]
+      },
+      {
+        "from": "backend/node_modules",
+        "to": "backend/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "delivery/default.env",
+        "to": "config/default.env"
+      },
+      {
+        "from": "delivery/docs",
+        "to": "docs"
+      }
+    ],
     "directories": {
-      "buildResources": "build"
+      "buildResources": "build",
+      "output": "dist"
     },
     "mac": {
       "target": [
         "dmg"
       ],
-      "category": "public.app-category.utilities"
+      "category": "public.app-category.utilities",
+      "identity": null,
+      "gatekeeperAssess": false
     },
     "win": {
       "target": [
         "nsis"
       ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
     }
   }
 }

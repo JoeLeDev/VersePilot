@@ -14,7 +14,11 @@ frontend/dist/
 .env.*
 !.env.example
 !backend/.env.example
+!services/license-proxy/.env.example
 backend/.env
+services/license-proxy/.env
+services/license-proxy/licenses.json
+services/license-proxy/node_modules/
 
 # Bibles & embeddings (lourds — régénérer avec npm run import-bibles / build-embeddings)
 backend/data/bibles/*.json
