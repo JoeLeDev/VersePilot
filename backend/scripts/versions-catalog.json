@@ -1,0 +1,57 @@
+[
+  {
+    "slug": "louis-segond",
+    "code": "LSG",
+    "name": "Louis Segond (1910)",
+    "lang": "fr",
+    "source": "baraka-lsg"
+  },
+  {
+    "slug": "segond-21",
+    "code": "S21",
+    "name": "Segond 21",
+    "lang": "fr",
+    "source": "unavailable",
+    "unavailableReason": "Texte sous copyright (Société Biblique de Genève). Non redistribuable en open data. Options : licence éditeur ou import manuel (voir data/bibles/README.md)."
+  },
+  {
+    "slug": "semeur",
+    "code": "BDS",
+    "name": "La Bible du Semeur",
+    "lang": "fr",
+    "source": "unavailable",
+    "unavailableReason": "Texte sous copyright (Biblica / Société biblique française). Import manuel ou API sous licence requis."
+  },
+  {
+    "slug": "darby",
+    "code": "JND",
+    "name": "Bible J.N. Darby",
+    "lang": "fr",
+    "source": "scrollmapper",
+    "scrollmapper": "FreJND"
+  },
+  {
+    "slug": "bible-expliquee",
+    "code": "BEX",
+    "name": "Bible expliquée",
+    "lang": "fr",
+    "source": "unavailable",
+    "unavailableReason": "Édition commentée sous copyright. Pas de JSON public complet trouvé."
+  },
+  {
+    "slug": "francais-courant",
+    "code": "BFC",
+    "name": "Bible en français courant (1997)",
+    "lang": "fr",
+    "source": "datagouv-frc97",
+    "datagouvUrl": "https://static.data.gouv.fr/resources/la-bible/20240707-211556/bible-fr.json"
+  },
+  {
+    "slug": "parole-de-vie-2017",
+    "code": "PDV17",
+    "name": "La Parole de Vie (2017)",
+    "lang": "fr",
+    "source": "unavailable",
+    "unavailableReason": "Texte sous copyright (Union Biblique Française). Import manuel ou API sous licence requis."
+  }
+]

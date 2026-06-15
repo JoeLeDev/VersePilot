@@ -1,0 +1,14 @@
+{
+  "licenses": [
+    {
+      "key": "VP-DEMO-0001-AAAA",
+      "church": "Église démo",
+      "contact": "regie@exemple.fr",
+      "active": true,
+      "plan": "standard",
+      "expiresAt": "2027-12-31T23:59:59.000Z",
+      "maxMinutesPerMonth": 600,
+      "notes": "Forfait ~4 cultes / mois × 1h30"
+    }
+  ]
+}

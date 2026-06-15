@@ -1,0 +1,758 @@
+[
+  {
+    "canonical": "Méphibosheth",
+    "aliases": ["mefiboseth", "mephiboseth", "méfie bossette", "méfie bauchette", "mefi boseth", "méphi boset"],
+    "type": "personnage",
+    "references": ["2 Samuel 4", "2 Samuel 9"]
+  },
+  {
+    "canonical": "Melchisédek",
+    "aliases": ["melchisedec", "melkisédek", "melchi tsedek", "melchisédech"],
+    "type": "personnage",
+    "references": ["Genèse 14", "Hébreux 7"]
+  },
+  {
+    "canonical": "Nebucadnetsar",
+    "aliases": ["nébucadnetsar", "nebucadnezar", "nabuchodonosor", "nabuchodonosor", "nébucadnétsar"],
+    "type": "personnage",
+    "references": ["Daniel"]
+  },
+  {
+    "canonical": "Zorobabel",
+    "aliases": ["zorobabel", "zerubbabel", "zérobabel"],
+    "type": "personnage",
+    "references": ["Esdras", "Aggée"]
+  },
+  {
+    "canonical": "Jojakin",
+    "aliases": ["joiakin", "joiakim", "jojakim", "jehoiakin"],
+    "type": "personnage",
+    "references": ["2 Rois 24"]
+  },
+  {
+    "canonical": "Jojada",
+    "aliases": ["joiada", "jehoiada", "jojadah"],
+    "type": "personnage",
+    "references": ["2 Rois 11"]
+  },
+  {
+    "canonical": "Jotham",
+    "aliases": ["jothan", "jotam"],
+    "type": "personnage",
+    "references": ["Juges 9", "2 Rois 15"]
+  },
+  {
+    "canonical": "Roboam",
+    "aliases": ["rehoboam", "réboam", "roboam"],
+    "type": "personnage",
+    "references": ["1 Rois 12"]
+  },
+  {
+    "canonical": "Jéroboam",
+    "aliases": ["jeroboam", "jéroboan", "jéroboam"],
+    "type": "personnage",
+    "references": ["1 Rois 12"]
+  },
+  {
+    "canonical": "Absalom",
+    "aliases": ["absalon", "avsalom", "absalon"],
+    "type": "personnage",
+    "references": ["2 Samuel"]
+  },
+  {
+    "canonical": "Achitophel",
+    "aliases": ["ahithophel", "achitofel", "ahitofel"],
+    "type": "personnage",
+    "references": ["2 Samuel 15"]
+  },
+  {
+    "canonical": "Élishama",
+    "aliases": ["elishama", "élichama"],
+    "type": "personnage",
+    "references": ["Nombres"]
+  },
+  {
+    "canonical": "Éliakim",
+    "aliases": ["eliakim", "éliakim"],
+    "type": "personnage",
+    "references": ["2 Rois 18", "Ésaïe 22"]
+  },
+  {
+    "canonical": "Éliézer",
+    "aliases": ["eliezer", "éliezer", "éliézer"],
+    "type": "personnage",
+    "references": ["Exode", "Luc"]
+  },
+  {
+    "canonical": "Élihou",
+    "aliases": ["elihu", "éliou", "élihou"],
+    "type": "personnage",
+    "references": ["Job 32"]
+  },
+  {
+    "canonical": "Élisée",
+    "aliases": ["elisee", "élisée", "elisha", "élisha"],
+    "type": "personnage",
+    "references": ["2 Rois"]
+  },
+  {
+    "canonical": "Ézéchias",
+    "aliases": ["ezechias", "ézéchias", "hezekiah", "ézékias"],
+    "type": "personnage",
+    "references": ["2 Rois 18"]
+  },
+  {
+    "canonical": "Ézéchiel",
+    "aliases": ["ezechiel", "ézéchiel", "ezekiel"],
+    "type": "livre",
+    "references": ["Ézéchiel"]
+  },
+  {
+    "canonical": "Habacuc",
+    "aliases": ["habacuc", "habakuk", "habacouk"],
+    "type": "livre",
+    "references": ["Habacuc"]
+  },
+  {
+    "canonical": "Sophonie",
+    "aliases": ["sophonie", "zéphania", "zéphanie"],
+    "type": "livre",
+    "references": ["Sophonie"]
+  },
+  {
+    "canonical": "Aggée",
+    "aliases": ["aggee", "aggée", "haggai"],
+    "type": "livre",
+    "references": ["Aggée"]
+  },
+  {
+    "canonical": "Zacharie",
+    "aliases": ["zacharie", "zacharia", "zachariah"],
+    "type": "livre",
+    "references": ["Zacharie"]
+  },
+  {
+    "canonical": "Malachie",
+    "aliases": ["malachie", "malachi", "malachie"],
+    "type": "livre",
+    "references": ["Malachie"]
+  },
+  {
+    "canonical": "Onésiphore",
+    "aliases": ["onesiphore", "onésiphore", "onesiphorus"],
+    "type": "personnage",
+    "references": ["2 Timothée 1"]
+  },
+  {
+    "canonical": "Tychique",
+    "aliases": ["tychique", "tychicus", "tichique"],
+    "type": "personnage",
+    "references": ["Actes 20", "Éphésiens 6"]
+  },
+  {
+    "canonical": "Épaphras",
+    "aliases": ["epaphras", "épaphras", "epaphrodite"],
+    "type": "personnage",
+    "references": ["Colossiens 1"]
+  },
+  {
+    "canonical": "Philémon",
+    "aliases": ["philemon", "philémon", "philémon"],
+    "type": "livre",
+    "references": ["Philémon"]
+  },
+  {
+    "canonical": "Timothée",
+    "aliases": ["timothee", "timothée", "timothy"],
+    "type": "personnage",
+    "references": ["1 Timothée", "2 Timothée"]
+  },
+  {
+    "canonical": "Barnabas",
+    "aliases": ["barnabé", "barnabe", "barnabas"],
+    "type": "personnage",
+    "references": ["Actes"]
+  },
+  {
+    "canonical": "Silas",
+    "aliases": ["silas", "sylas", "silvanus"],
+    "type": "personnage",
+    "references": ["Actes"]
+  },
+  {
+    "canonical": "Ananias",
+    "aliases": ["ananias", "hananias", "ananias de damas"],
+    "type": "personnage",
+    "references": ["Actes 9"]
+  },
+  {
+    "canonical": "Saphira",
+    "aliases": ["saphira", "sapphira", "sapira"],
+    "type": "personnage",
+    "references": ["Actes 5"]
+  },
+  {
+    "canonical": "Gamaliel",
+    "aliases": ["gamaliel", "gamaliel"],
+    "type": "personnage",
+    "references": ["Actes 5"]
+  },
+  {
+    "canonical": "Nicodème",
+    "aliases": ["nicodeme", "nicodème", "nicodemus"],
+    "type": "personnage",
+    "references": ["Jean 3"]
+  },
+  {
+    "canonical": "Zachée",
+    "aliases": ["zachee", "zachée", "zaccheus"],
+    "type": "personnage",
+    "references": ["Luc 19"]
+  },
+  {
+    "canonical": "Barthimée",
+    "aliases": ["barthimee", "bartimée", "bartimee"],
+    "type": "personnage",
+    "references": ["Marc 10"]
+  },
+  {
+    "canonical": "Bartimée",
+    "aliases": ["bartimee", "barthimée"],
+    "type": "personnage",
+    "references": ["Marc 10"]
+  },
+  {
+    "canonical": "Barabbas",
+    "aliases": ["bar abbas", "barabbas", "barabas"],
+    "type": "personnage",
+    "references": ["Matthieu 27"]
+  },
+  {
+    "canonical": "Bar-Jésus",
+    "aliases": ["bar jésus", "barjesus", "elymas"],
+    "type": "personnage",
+    "references": ["Actes 13"]
+  },
+  {
+    "canonical": "Lazare",
+    "aliases": ["lazare", "lazarus", "lazarre"],
+    "type": "personnage",
+    "references": ["Jean 11"]
+  },
+  {
+    "canonical": "Marthe",
+    "aliases": ["marthe", "martha"],
+    "type": "personnage",
+    "references": ["Luc 10", "Jean 11"]
+  },
+  {
+    "canonical": "Marie de Magdala",
+    "aliases": ["marie magdala", "marie madeleine", "madeleine", "magdalene"],
+    "type": "personnage",
+    "references": ["Luc 8", "Jean 20"]
+  },
+  {
+    "canonical": "Jaïrus",
+    "aliases": ["jairus", "jaïrus", "jair"],
+    "type": "personnage",
+    "references": ["Marc 5"]
+  },
+  {
+    "canonical": "Corneille",
+    "aliases": ["cornelius", "cornélius", "cornille"],
+    "type": "personnage",
+    "references": ["Actes 10"]
+  },
+  {
+    "canonical": "Lodébar",
+    "aliases": ["lodebar", "lodébar", "lo debar"],
+    "type": "lieu",
+    "references": ["2 Samuel 9"]
+  },
+  {
+    "canonical": "Jéricho",
+    "aliases": ["jericho", "jéricho", "jéricho"],
+    "type": "lieu",
+    "references": ["Josué 6"]
+  },
+  {
+    "canonical": "Bethléem",
+    "aliases": ["bethleem", "bethléem", "bethlehem", "béthléem"],
+    "type": "lieu",
+    "references": ["Luc 2"]
+  },
+  {
+    "canonical": "Nazareth",
+    "aliases": ["nazareth", "nazaret"],
+    "type": "lieu",
+    "references": ["Luc 2"]
+  },
+  {
+    "canonical": "Capernaüm",
+    "aliases": ["capernaum", "capernaüm", "capharnaüm", "capharnaum"],
+    "type": "lieu",
+    "references": ["Matthieu 4"]
+  },
+  {
+    "canonical": "Gethsémané",
+    "aliases": ["gethsemane", "gethsémané", "jardin de gethsémané"],
+    "type": "lieu",
+    "references": ["Matthieu 26"]
+  },
+  {
+    "canonical": "Golgotha",
+    "aliases": ["golgotha", "calvaire", "lieu du crâne"],
+    "type": "lieu",
+    "references": ["Matthieu 27"]
+  },
+  {
+    "canonical": "Béthanie",
+    "aliases": ["bethanie", "béthanie", "bethany"],
+    "type": "lieu",
+    "references": ["Jean 11"]
+  },
+  {
+    "canonical": "Samarie",
+    "aliases": ["samarie", "samaria", "samaritain"],
+    "type": "lieu",
+    "references": ["Jean 4"]
+  },
+  {
+    "canonical": "Éphèse",
+    "aliases": ["ephese", "éphèse", "ephesus"],
+    "type": "lieu",
+    "references": ["Actes 19"]
+  },
+  {
+    "canonical": "Thessalonique",
+    "aliases": ["thessalonique", "thessaloniki", "thessalonices"],
+    "type": "lieu",
+    "references": ["Actes 17"]
+  },
+  {
+    "canonical": "Philippi",
+    "aliases": ["philippi", "philippes", "philippe"],
+    "type": "lieu",
+    "references": ["Actes 16"]
+  },
+  {
+    "canonical": "Colosses",
+    "aliases": ["colosses", "colossae", "colosse"],
+    "type": "lieu",
+    "references": ["Colossiens"]
+  },
+  {
+    "canonical": "Laodicée",
+    "aliases": ["laodicee", "laodicée", "laodicea"],
+    "type": "lieu",
+    "references": ["Apocalypse 3"]
+  },
+  {
+    "canonical": "Pergame",
+    "aliases": ["pergame", "pergamos", "pergamum"],
+    "type": "lieu",
+    "references": ["Apocalypse 2"]
+  },
+  {
+    "canonical": "Thyatire",
+    "aliases": ["thyatire", "thyatira"],
+    "type": "lieu",
+    "references": ["Apocalypse 2"]
+  },
+  {
+    "canonical": "Sardes",
+    "aliases": ["sardes", "sardis"],
+    "type": "lieu",
+    "references": ["Apocalypse 3"]
+  },
+  {
+    "canonical": "Patmos",
+    "aliases": ["patmos", "patmos"],
+    "type": "lieu",
+    "references": ["Apocalypse 1"]
+  },
+  {
+    "canonical": "Antioche",
+    "aliases": ["antioche", "antioch", "antiochia"],
+    "type": "lieu",
+    "references": ["Actes 11"]
+  },
+  {
+    "canonical": "Tarse",
+    "aliases": ["tarse", "tarsus"],
+    "type": "lieu",
+    "references": ["Actes 9"]
+  },
+  {
+    "canonical": "Ninive",
+    "aliases": ["ninive", "nineveh", "ninivé"],
+    "type": "lieu",
+    "references": ["Jonas"]
+  },
+  {
+    "canonical": "Babylone",
+    "aliases": ["babylone", "babylon"],
+    "type": "lieu",
+    "references": ["Daniel", "Apocalypse"]
+  },
+  {
+    "canonical": "Jérusalem",
+    "aliases": ["jerusalem", "jérusalem", "sion", "sion"],
+    "type": "lieu",
+    "references": ["Psaumes"]
+  },
+  {
+    "canonical": "Éphésiens",
+    "aliases": ["ephesiens", "éphésiens", "ephesians"],
+    "type": "livre",
+    "references": ["Éphésiens"]
+  },
+  {
+    "canonical": "Philippiens",
+    "aliases": ["philippiens", "philippians"],
+    "type": "livre",
+    "references": ["Philippiens"]
+  },
+  {
+    "canonical": "Colossiens",
+    "aliases": ["colossiens", "colossians"],
+    "type": "livre",
+    "references": ["Colossiens"]
+  },
+  {
+    "canonical": "Thessaloniciens",
+    "aliases": ["thessaloniciens", "thessalonians"],
+    "type": "livre",
+    "references": ["1 Thessaloniciens", "2 Thessaloniciens"]
+  },
+  {
+    "canonical": "Deutéronome",
+    "aliases": ["deuteronome", "deuteronomie", "deuteronome"],
+    "type": "livre",
+    "references": ["Deutéronome"]
+  },
+  {
+    "canonical": "Lévitique",
+    "aliases": ["levitique", "lévitique", "levitic"],
+    "type": "livre",
+    "references": ["Lévitique"]
+  },
+  {
+    "canonical": "Néhémie",
+    "aliases": ["nehemie", "néhémie", "nehemiah"],
+    "type": "livre",
+    "references": ["Néhémie"]
+  },
+  {
+    "canonical": "Ecclésiaste",
+    "aliases": ["ecclesiaste", "ecclésiaste", "ecclesiastes", "l'ecclésiaste"],
+    "type": "livre",
+    "references": ["Ecclésiaste"]
+  },
+  {
+    "canonical": "Cantique des Cantiques",
+    "aliases": ["cantique des cantiques", "cantique", "song of solomon"],
+    "type": "livre",
+    "references": ["Cantique des Cantiques"]
+  },
+  {
+    "canonical": "Apocalypse",
+    "aliases": ["apocalypse", "revelation", "révélation"],
+    "type": "livre",
+    "references": ["Apocalypse"]
+  },
+  {
+    "canonical": "Arche d'Alliance",
+    "aliases": ["arche de l'alliance", "arche d alliance", "arche sainte"],
+    "type": "objet",
+    "references": ["Exode 25"]
+  },
+  {
+    "canonical": "Urim",
+    "aliases": ["urim", "ourim"],
+    "type": "objet",
+    "references": ["Exode 28"]
+  },
+  {
+    "canonical": "Thummim",
+    "aliases": ["thummim", "thoumim"],
+    "type": "objet",
+    "references": ["Exode 28"]
+  },
+  {
+    "canonical": "Éphod",
+    "aliases": ["éphod", "ephod", "éfod"],
+    "type": "objet",
+    "references": ["Exode 28"]
+  },
+  {
+    "canonical": "Tabernacle",
+    "aliases": ["tabernacle", "tente de la rencontre"],
+    "type": "objet",
+    "references": ["Exode"]
+  },
+  {
+    "canonical": "Propitiatoire",
+    "aliases": ["propitiatoire", "expiatoire", "mercy seat"],
+    "type": "objet",
+    "references": ["Exode 25"]
+  },
+  {
+    "canonical": "Chérubins",
+    "aliases": ["chérubins", "cherubins", "chérubim"],
+    "type": "objet",
+    "references": ["Genèse 3"]
+  },
+  {
+    "canonical": "Séraphins",
+    "aliases": ["séraphins", "seraphins", "seraphim"],
+    "type": "objet",
+    "references": ["Ésaïe 6"]
+  },
+  {
+    "canonical": "Manne",
+    "aliases": ["manne", "manne du désert"],
+    "type": "objet",
+    "references": ["Exode 16"]
+  },
+  {
+    "canonical": "Encensoir",
+    "aliases": ["encensoir", "encensoire"],
+    "type": "objet",
+    "references": ["Nombres 16"]
+  },
+  {
+    "canonical": "Houlette",
+    "aliases": ["houlette", "houlette de berger"],
+    "type": "objet",
+    "references": ["Psaumes 23"]
+  },
+  {
+    "canonical": "Verge d'Aaron",
+    "aliases": ["verge d aaron", "verge d'aaron", "verge d aaron"],
+    "type": "objet",
+    "references": ["Nombres 17"]
+  },
+  {
+    "canonical": "Michaël",
+    "aliases": ["michael", "michaël", "michel archange"],
+    "type": "ange",
+    "references": ["Daniel 10", "Jude 1"]
+  },
+  {
+    "canonical": "Gabriel",
+    "aliases": ["gabriel", "gabriel archange"],
+    "type": "ange",
+    "references": ["Luc 1"]
+  },
+  {
+    "canonical": "Lucifer",
+    "aliases": ["lucifer", "lucifère"],
+    "type": "ange",
+    "references": ["Ésaïe 14"]
+  },
+  {
+    "canonical": "Bélial",
+    "aliases": ["belial", "bélial", "beliar"],
+    "type": "ange",
+    "references": ["2 Corinthiens 6"]
+  },
+  {
+    "canonical": "Archange",
+    "aliases": ["archange", "archanges"],
+    "type": "ange",
+    "references": ["1 Thessaloniciens 4"]
+  },
+  {
+    "canonical": "Amalécites",
+    "aliases": ["amalecites", "amalécites", "amalekites"],
+    "type": "peuple",
+    "references": ["1 Samuel 15"]
+  },
+  {
+    "canonical": "Philistins",
+    "aliases": ["philistins", "philistines", "pélishtim"],
+    "type": "peuple",
+    "references": ["1 Samuel"]
+  },
+  {
+    "canonical": "Moabites",
+    "aliases": ["moabites", "moab"],
+    "type": "peuple",
+    "references": ["Ruth"]
+  },
+  {
+    "canonical": "Madianites",
+    "aliases": ["madianites", "midianites", "madian"],
+    "type": "peuple",
+    "references": ["Juges 6"]
+  },
+  {
+    "canonical": "Amoréens",
+    "aliases": ["amoreens", "amoréens", "amorites"],
+    "type": "peuple",
+    "references": ["Josué"]
+  },
+  {
+    "canonical": "Cananéens",
+    "aliases": ["cananeens", "cananéens", "cananites"],
+    "type": "peuple",
+    "references": ["Josué"]
+  },
+  {
+    "canonical": "Hittites",
+    "aliases": ["hittites", "hethites", "héthiens"],
+    "type": "peuple",
+    "references": ["Genèse"]
+  },
+  {
+    "canonical": "Jébusiens",
+    "aliases": ["jebusiens", "jébusiens", "jebusites"],
+    "type": "peuple",
+    "references": ["Josué"]
+  },
+  {
+    "canonical": "Girgasiens",
+    "aliases": ["girgasiens", "girgashites"],
+    "type": "peuple",
+    "references": ["Josué"]
+  },
+  {
+    "canonical": "Édomites",
+    "aliases": ["edomites", "édomites", "edom"],
+    "type": "peuple",
+    "references": ["Genèse"]
+  },
+  {
+    "canonical": "Assyriens",
+    "aliases": ["assyriens", "assyrians", "assur"],
+    "type": "peuple",
+    "references": ["2 Rois"]
+  },
+  {
+    "canonical": "Babyloniens",
+    "aliases": ["babyloniens", "babylonians"],
+    "type": "peuple",
+    "references": ["Daniel"]
+  },
+  {
+    "canonical": "fils prodigue",
+    "aliases": ["le fils prodigue", "fils perdu"],
+    "type": "expression",
+    "references": ["Luc 15"]
+  },
+  {
+    "canonical": "vallée des ossements desséchés",
+    "aliases": ["vallée des ossements", "ossements desséchés", "vallee des os"],
+    "type": "expression",
+    "references": ["Ézéchiel 37"]
+  },
+  {
+    "canonical": "vallée de l'ombre de la mort",
+    "aliases": ["vallee de l ombre de la mort", "ombre de la mort"],
+    "type": "expression",
+    "references": ["Psaumes 23"]
+  },
+  {
+    "canonical": "bon Samaritain",
+    "aliases": ["bon samaritain", "samaritain", "le samaritain"],
+    "type": "expression",
+    "references": ["Luc 10"]
+  },
+  {
+    "canonical": "tour de Babel",
+    "aliases": ["tour de babel", "babel"],
+    "type": "expression",
+    "references": ["Genèse 11"]
+  },
+  {
+    "canonical": "mer Rouge",
+    "aliases": ["mer rouge", "red sea"],
+    "type": "expression",
+    "references": ["Exode 14"]
+  },
+  {
+    "canonical": "mont Sinaï",
+    "aliases": ["mont sinai", "sinaï", "sinai"],
+    "type": "expression",
+    "references": ["Exode 19"]
+  },
+  {
+    "canonical": "mont des Oliviers",
+    "aliases": ["mont des oliviers", "olivet", "mont olivet"],
+    "type": "expression",
+    "references": ["Matthieu 24"]
+  },
+  {
+    "canonical": "chemin de Damas",
+    "aliases": ["route de damas", "chemin damas"],
+    "type": "expression",
+    "references": ["Actes 9"]
+  },
+  {
+    "canonical": "fournaise ardente",
+    "aliases": ["fournaise", "fournaise de feu"],
+    "type": "expression",
+    "references": ["Daniel 3"]
+  },
+  {
+    "canonical": "fosse aux lions",
+    "aliases": ["fosse aux lion", "fosse de lions"],
+    "type": "expression",
+    "references": ["Daniel 6"]
+  },
+  {
+    "canonical": "veau d'or",
+    "aliases": ["veau d or", "veau en or"],
+    "type": "expression",
+    "references": ["Exode 32"]
+  },
+  {
+    "canonical": "arche de Noé",
+    "aliases": ["arche de noe", "arche noé", "arche noah"],
+    "type": "expression",
+    "references": ["Genèse 6"]
+  },
+  {
+    "canonical": "lavement des pieds",
+    "aliases": ["laver les pieds", "lavement des pied"],
+    "type": "expression",
+    "references": ["Jean 13"]
+  },
+  {
+    "canonical": "sermon sur la montagne",
+    "aliases": ["sermon de la montagne", "montagne sermon"],
+    "type": "expression",
+    "references": ["Matthieu 5"]
+  },
+  {
+    "canonical": "résurrection de Lazare",
+    "aliases": ["lazare ressuscité", "ressuscitation de lazare"],
+    "type": "expression",
+    "references": ["Jean 11"]
+  },
+  {
+    "canonical": "multiplication des pains",
+    "aliases": ["multiplication du pain", "cinq pains deux poissons"],
+    "type": "expression",
+    "references": ["Matthieu 14"]
+  },
+  {
+    "canonical": "marche sur les eaux",
+    "aliases": ["marchent sur les eaux", "marche sur l eau"],
+    "type": "expression",
+    "references": ["Matthieu 14"]
+  },
+  {
+    "canonical": "Pentecôte",
+    "aliases": ["pentecote", "pentecôte", "pentecost"],
+    "type": "expression",
+    "references": ["Actes 2"]
+  },
+  {
+    "canonical": "armure de Dieu",
+    "aliases": ["armure du seigneur", "armure de dieu"],
+    "type": "expression",
+    "references": ["Éphésiens 6"]
+  }
+]

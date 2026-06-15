@@ -1,0 +1,57 @@
+# Dépendances
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+
+# Builds
+dist/
+out/
+release/
+frontend/dist/
+
+# Secrets
+.env
+.env.*
+!.env.example
+!backend/.env.example
+!services/license-proxy/.env.example
+backend/.env
+services/license-proxy/.env
+services/license-proxy/licenses.json
+services/license-proxy/node_modules/
+
+# Bibles & embeddings (lourds — générés automatiquement par npm run release)
+backend/data/bibles/*.json
+!backend/data/bibles/index.json
+backend/data/bibles/*.embeddings.bin
+backend/data/bibles/*.embeddings.meta.json
+backend/data/bibles/*.local.embeddings.bin
+backend/data/bibles/*.local.embeddings.meta.json
+
+# Modèle e5 embarqué (npm run download-embed-model --prefix backend)
+backend/models/transformers/
+
+# Modèles Whisper local (télécharger séparément)
+backend/models/
+backend/models/*.bin
+
+# Python (MLX STT)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs & OS
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# IDE (optionnel)
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Cache
+.cache/
+coverage/
