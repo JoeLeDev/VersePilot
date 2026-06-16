@@ -1,10 +1,61 @@
 import { useEffect, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import { ConfigPanel } from "./components/ConfigPanel";
+import { DemoScreen } from "./components/DemoScreen";
+import { HypothesisList } from "./components/HypothesisList";
+import { LiveTranscription } from "./components/LiveTranscription";
+import { ProPresenterSettings } from "./components/ProPresenterSettings";
+import { SearchPanel } from "./components/SearchPanel";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useProPresenter } from "./hooks/useProPresenter";
+import {
+  countWordOverlap,
+  extractLastPhrase,
+  isDuplicateTranscriptAddition,
+  isSttPromptEchoText,
+  isSttRepetitiveHallucination,
+} from "./utils/transcript";
+import {
+  detectionSourceLabel,
+  ensureVerseCoords,
+  formatDetectionTime,
+  splitVerseIntoPages,
+  verseIdentityKey,
+  verseScoreLabel,
+} from "./utils/verse";
+import {
+  canUseSystemAudio,
+  float32ToInt16Bytes,
+  formatCaptureError,
+  PCM_WORKLET_SRC,
+  resampleFloat32,
+  STREAM_TARGET_RATE,
+} from "./utils/audio";
+import type {
+  AppConfig,
+  BibleContext,
+  BibleVersion,
+  Detection,
+  Preview,
+  SentHistoryEntry,
+  AudioOverlap,
+  TranscribeJob,
+  TranscriptSegment,
+  Verse,
+  VerseRef,
+} from "./types";
+import { apiUrl, wsUrl } from "./utils/api";
+import { errorMessage } from "./utils/errors";
+import {
+  loadJSON,
+  saveJSON,
+  LS_AUDIO_KEY,
+  LS_BIBLE_KEY,
+  LS_DETECTIONS_KEY,
+  LS_HISTORY_KEY,
+  LS_KEY,
+} from "./utils/storage";
 
-const LS_KEY = "versepilot.config.v1";
-const LS_BIBLE_KEY = "versepilot.bible.v1";
-const LS_AUDIO_KEY = "versepilot.audio.v1";
-const LS_DETECTIONS_KEY = "versepilot.detections.v1";
-const LS_HISTORY_KEY = "versepilot.history.v1";
 const MAX_HISTORY = 60;
 const MAX_STORED_DETECTIONS = 50;
 const MIC_LEVEL_SCALE = 520;
@@ -12,7 +63,7 @@ const MIC_LEVEL_MIN_SPEECH = 8;
 
 const defaultConfig = {
   ip: "127.0.0.1",
-  port: 50001,
+  port: 49354,
   dualMessages: false,
   dualMessageOrder: "verse-first",
   messageId: "",
@@ -25,34 +76,15 @@ const defaultConfig = {
   verseMaxChars: 220,
   detectionMinPercent: 80,
   streaming: true,
+  demoMode: false,
+  liveMode: false,
+  serviceName: "Culte du dimanche",
   noiseSuppression: true,
   echoCancellation: false,
   autoGainControl: false,
   inputGain: 100,
 };
 
-/** Découpe un verset trop long en pages, sans couper les mots. */
-function splitVerseIntoPages(text, maxChars = 220) {
-  const clean = (text || "").trim();
-  const limit = Number(maxChars) > 0 ? Number(maxChars) : 220;
-  if (!clean || clean.length <= limit) return [clean];
-  const words = clean.split(/\s+/);
-  const pages = [];
-  let cur = "";
-  for (const w of words) {
-    if (cur && cur.length + 1 + w.length > limit) {
-      pages.push(cur);
-      cur = w;
-    } else {
-      cur = cur ? `${cur} ${w}` : w;
-    }
-  }
-  if (cur) pages.push(cur);
-  return pages;
-}
-
-const API_BASE =
-  window.location.protocol === "file:" ? "http://127.0.0.1:4000" : "";
 const VAD_RMS_THRESHOLD = 0.006;
 const VAD_MIN_AVG_RMS = 0.004;
 const VAD_MIN_AVG_RMS_SYSTEM = 0.0015;
@@ -65,7 +97,6 @@ const VOICE_SILENCE_TAIL_MS = 600;
 const VOICE_MIN_CHUNK_MS = 900;
 const TRANSCRIBE_MAX_PARALLEL = 1;
 const TRANSCRIBE_MAX_PENDING = 2;
-const LAST_PHRASE_MAX_WORDS = 12;
 const MIN_PHRASE_CHARS = 6;
 const LIVE_SEARCH_DEBOUNCE_MS = 120;
 const DETECTION_MIN_SCORE = 22;
@@ -75,424 +106,83 @@ const MAX_QUEUE = 20;
 const CONTEXT_RADIUS = 3;
 const PIN_UNPIN_GRACE_MS = 45000;
 
-function apiUrl(path) {
-  return `${API_BASE}${path}`;
-}
-
-function wsUrl(path) {
-  if (API_BASE) {
-    return `${API_BASE.replace(/^http/, "ws")}${path}`;
-  }
-  const proto = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${window.location.host}${path}`;
-}
-
-// AudioWorklet : capture du PCM sur le thread audio (remplace ScriptProcessor).
-// Accumule ~2048 échantillons puis les transfère au thread principal.
-const PCM_WORKLET_SRC = `
-class PCMCapture extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this._buf = [];
-    this._count = 0;
-    this._target = 2048;
-  }
-  process(inputs) {
-    const input = inputs[0];
-    if (input && input[0]) {
-      const ch = input[0];
-      this._buf.push(new Float32Array(ch));
-      this._count += ch.length;
-      if (this._count >= this._target) {
-        const merged = new Float32Array(this._count);
-        let o = 0;
-        for (const b of this._buf) { merged.set(b, o); o += b.length; }
-        this.port.postMessage(merged, [merged.buffer]);
-        this._buf = [];
-        this._count = 0;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('pcm-capture', PCMCapture);
-`;
-
-const STREAM_TARGET_RATE = 16000;
-
-/** Rééchantillonnage linéaire Float32 vers un autre taux. */
-function resampleFloat32(input, inRate, outRate) {
-  if (inRate === outRate) return input;
-  const ratio = inRate / outRate;
-  const outLength = Math.max(1, Math.floor(input.length / ratio));
-  const out = new Float32Array(outLength);
-  for (let i = 0; i < outLength; i += 1) {
-    const srcPos = i * ratio;
-    const idx = Math.floor(srcPos);
-    const frac = srcPos - idx;
-    const a = input[idx] || 0;
-    const b = input[idx + 1] != null ? input[idx + 1] : a;
-    out[i] = a + (b - a) * frac;
-  }
-  return out;
-}
-
-function float32ToInt16Bytes(float32) {
-  const out = new Int16Array(float32.length);
-  for (let i = 0; i < float32.length; i += 1) {
-    const s = Math.max(-1, Math.min(1, float32[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out;
-}
-
-function isSafariBrowser() {
-  if (typeof navigator === "undefined") return false;
-  const ua = navigator.userAgent;
-  return /Safari/i.test(ua) && !/Chrome|Chromium|Edg|Electron/i.test(ua);
-}
-
-function canUseSystemAudio() {
-  return (
-    typeof navigator !== "undefined" &&
-    !!navigator.mediaDevices?.getDisplayMedia &&
-    !isSafariBrowser()
-  );
-}
-
-function formatCaptureError(err) {
-  const name = err?.name || "";
-  const msg = err?.message || String(err);
-
-  if (name === "NotSupportedError" || /not supported/i.test(msg)) {
-    if (isSafariBrowser()) {
-      return "Safari ne capture pas le son système. Utilise Chrome ou l’app Electron (npm run dev).";
-    }
-    if (window.versepilotDesktop?.isDesktop) {
-      return "Son système indisponible. Redémarre l’app Electron, ou utilise Micro + BlackHole.";
-    }
-    return "Son système non supporté ici. Ouvre l’app avec npm run dev (Electron) ou Chrome, pas Safari.";
-  }
-  if (name === "NotAllowedError" || /denied|permission/i.test(msg)) {
-    return "Partage refusé ou annulé. Réessaie et coche « Partager l’audio » (Mac) ou « Share system audio ».";
-  }
-  if (
-    /could not start audio|audio source|loopback/i.test(msg) ||
-    name === "NotReadableError"
-  ) {
-    return "Audio système refusé par macOS. Relance l’app Electron (npm run dev), partage l’écran entier avec « Partager l’audio du Mac », ou utilise Micro + BlackHole.";
-  }
-  if (name === "AbortError") {
-    return "Capture annulée.";
-  }
-  return msg;
-}
-
-function isSttRepetitiveHallucination(text) {
-  if (!text) return false;
-  const tokens = text
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .split(/\s+/)
-    .filter(Boolean);
-  const n = tokens.length;
-  if (n >= 8 && new Set(tokens.slice(-8)).size === 1) return true;
-  if (n >= 12 && new Set(tokens).size / n < 0.2) return true;
-  let prev = null;
-  let runLen = 0;
-  for (const token of tokens) {
-    if (token === prev) {
-      runLen += 1;
-      if (runLen >= 6) return true;
-    } else {
-      prev = token;
-      runLen = 1;
-    }
-  }
-  return false;
-}
-
-function isDuplicateTranscriptAddition(addition, transcript) {
-  const add = addition.trim().toLowerCase();
-  if (!add || add.length < 12) return false;
-  const full = transcript.trim().toLowerCase();
-  if (!full) return false;
-  if (full.endsWith(add)) return true;
-  const lastPhrase = extractLastPhrase(transcript).trim().toLowerCase();
-  if (lastPhrase && lastPhrase === add) return true;
-  if (add.length >= 20 && full.includes(add)) {
-    const tail = full.slice(-Math.min(full.length, add.length * 3));
-    if (tail.split(add).length > 2) return true;
-  }
-  return false;
-}
-
-function isSttKnownHallucination(text) {
-  const n = text
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s']/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!n) return false;
-  const exact = [
-    "sous titrage societe radio canada",
-    "sous titrage st 501",
-    "merci d avoir regarde",
-    "thank you for watching",
-    "thanks for watching",
-    "subtitles by the amara org community",
-  ];
-  if (exact.some((p) => n === p || n.includes(p))) return true;
-  if (/sous\s*titrage/.test(n) && /radio\s*canada/.test(n)) return true;
-  if (/sous\s*titrage/.test(n) && n.length < 80) return true;
-  if (/merci\s+d\s*avoir\s+regard/.test(n)) return true;
-  return false;
-}
-
-function isSttPromptEchoText(text) {
-  const t = text.trim();
-  if (!t) return true;
-  if (isSttKnownHallucination(t)) return true;
-  if (isSttRepetitiveHallucination(t)) return true;
-  const n = t
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s.]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (
-    /^(?:predication en francais\.?\s*)?(?:lecture biblique louis segond\.?\s*)+$/.test(
-      n
-    )
-  ) {
-    return true;
-  }
-  if (
-    n.includes("bible francaise louis segond") &&
-    n.includes("versets bibliques") &&
-    t.length < 220
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function normalizeMergeWords(text) {
-  return text
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s']/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function countWordOverlap(transcriptWords, newWords, maxWords = 14) {
-  if (!transcriptWords.length || !newWords.length) return 0;
-  const limit = Math.min(maxWords, transcriptWords.length, newWords.length);
-  for (let n = limit; n >= 2; n -= 1) {
-    const suffix = normalizeMergeWords(transcriptWords.slice(-n).join(" "));
-    const prefix = normalizeMergeWords(newWords.slice(0, n).join(" "));
-    if (suffix && suffix === prefix) return n;
-  }
-  return 0;
-}
-
-function extractLastPhrase(transcript, maxWords = LAST_PHRASE_MAX_WORDS) {
-  const t = transcript.trim();
-  if (!t) return "";
-  const parts = t.split(/(?<=[.!?…])\s+/).filter(Boolean);
-  const lastSentence = (parts[parts.length - 1] || t).trim();
-  const words = lastSentence.split(/\s+/).filter(Boolean);
-  if (words.length <= maxWords) return lastSentence;
-  return words.slice(-maxWords).join(" ");
-}
-
-function splitTranscriptHighlight(full) {
-  const last = extractLastPhrase(full);
-  if (!last) return { before: full, last: "" };
-  const idx = full.lastIndexOf(last);
-  if (idx < 0) return { before: full, last: "" };
-  return {
-    before: full.slice(0, idx).trimEnd(),
-    last,
-  };
-}
-
-function verseScoreLabel(verse) {
-  if (verse.source === "semantic") {
-    const pct =
-      verse.semanticPercent ??
-      (verse.reason?.match(/(\d+)\s*%/)?.[1]
-        ? Number(verse.reason.match(/(\d+)\s*%/)[1])
-        : null);
-    return pct != null ? `${pct}% sens` : "Sémantique";
-  }
-  if (verse.source === "reference") return "Référence";
-  if (verse.tokenHits) {
-    return `${verse.tokenHits} mot${verse.tokenHits > 1 ? "s" : ""}`;
-  }
-  return "Texte";
-}
-
-function formatDetectionTime(ts) {
-  return new Date(ts).toLocaleTimeString("fr-FR", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-function detectionSourceLabel(source) {
-  if (source === "reference") return "Référence";
-  if (source === "chapter") return "Chapitre";
-  if (source === "citation") return "Citation";
-  if (source === "semantic") return "Sémantique";
-  if (source === "lexical") return "Mots";
-  return "Texte";
-}
-
-/** Score 0-100 d'un verset (score lexical/IA, sinon similarité sémantique). */
-function verseScoreNumber(verse) {
-  if (typeof verse.score === "number" && verse.score > 0) {
-    return Math.min(100, Math.round(verse.score));
-  }
-  if (typeof verse.semanticPercent === "number") {
-    return Math.min(100, Math.round(verse.semanticPercent));
-  }
-  return 0;
-}
-
-/** Palier de confiance pour l'affichage (couleur + libellé). */
-function confidenceTier(score) {
-  if (score >= 85) return { key: "confirmed", label: "Confirmé" };
-  if (score >= 60) return { key: "probable", label: "Probable" };
-  return { key: "hypothesis", label: "Hypothèse" };
-}
-
-/** Tags courts dérivés de la source/des correspondances, sans inventer de data. */
-function parseReference(ref) {
-  const m = String(ref || "")
-    .trim()
-    .match(/^(.+?)\s+(\d+)\s*:\s*(\d+)\s*$/);
-  if (!m) return null;
-  return {
-    book: m[1].trim(),
-    chapter: Number(m[2]),
-    verse: Number(m[3]),
-  };
-}
-
-function ensureVerseCoords(verse) {
-  if (!verse) return verse;
-  if (verse.book && verse.chapter && verse.verse) return verse;
-  const p = parseReference(verse.reference);
-  return p ? { ...verse, ...p } : verse;
-}
-
-function verseIdentityKey(verse) {
-  const v = ensureVerseCoords(verse);
-  if (v.book && v.chapter && v.verse) {
-    return `${v.book}|${v.chapter}|${v.verse}`;
-  }
-  return v.reference || "";
-}
-
-function verseTags(verse) {
-  const tags = [];
-  if (verse.source === "reference" || verse.source === "chapter") {
-    tags.push("référence");
-  }
-  if (verse.source === "semantic") tags.push("thème");
-  if (verse.source === "citation") tags.push("citation");
-  if (verse.source === "lexical") tags.push("mots-clés");
-  if (verse.tokenHits) {
-    tags.push(`${verse.tokenHits} mot${verse.tokenHits > 1 ? "s" : ""}`);
-  }
-  if (!tags.length) tags.push("texte");
-  return tags.slice(0, 3);
-}
-
 export default function App() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState([]);
+  const [results, setResults] = useState<Verse[]>([]);
   const [error, setError] = useState("");
-  const [config, setConfig] = useState(defaultConfig);
+  const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [showConfig, setShowConfig] = useState(false);
-  const [lastSent, setLastSent] = useState(null);
-  const [lastSentVerse, setLastSentVerse] = useState(null); // verset complet affiché
-  const [pinnedVerse, setPinnedVerse] = useState(null); // verset affiché en tête (même après désépinglage)
+  const [lastSentVerse, setLastSentVerse] = useState<Verse | null>(null); // verset complet affiché
+  const [pinnedVerse, setPinnedVerse] = useState<Verse | null>(null); // verset affiché en tête (même après désépinglage)
   const [pinActive, setPinActive] = useState(false); // true = verset « Live » actif
-  const unpinGraceTimerRef = useRef(null);
-  const [bibleContext, setBibleContext] = useState(null);
-  const [contextCenter, setContextCenter] = useState(null);
+  const unpinGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [bibleContext, setBibleContext] = useState<BibleContext | null>(null);
+  const [contextCenter, setContextCenter] = useState<VerseRef | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
-  const [sending, setSending] = useState(null); // reference being sent
-  const [history, setHistory] = useState([]);
-  const [ppConnected, setPpConnected] = useState(null); // null=inconnu, true, false
-  const [hiding, setHiding] = useState(false);
-  const [preview, setPreview] = useState(null); // { verse, pages, pageIndex }
-  const [ppStatus, setPpStatus] = useState(null);
-  const [ppStatusLoading, setPpStatusLoading] = useState(false);
-  const [ppMessages, setPpMessages] = useState([]);
-  const [ppMessagesLoading, setPpMessagesLoading] = useState(false);
+  const [history, setHistory] = useState<SentHistoryEntry[]>([]);
+  const [preview, setPreview] = useState<Preview | null>(null);
+  const [demoFullscreen, setDemoFullscreen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [speechSupported] = useState(
     Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
   );
   const [liveTranscript, setLiveTranscript] = useState("");
   const [fullTranscript, setFullTranscript] = useState("");
-  const [transcriptSegments, setTranscriptSegments] = useState([]);
+  const [transcriptSegments, setTranscriptSegments] = useState<
+    TranscriptSegment[]
+  >([]);
   const [lastPhrase, setLastPhrase] = useState("");
-  const [detections, setDetections] = useState([]);
+  const [detections, setDetections] = useState<Detection[]>([]);
   const [detectionsPage, setDetectionsPage] = useState(0);
-  const [queue, setQueue] = useState([]);
+  const [queue, setQueue] = useState<Verse[]>([]);
   const [liveSearching, setLiveSearching] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [pendingTranscriptions, setPendingTranscriptions] = useState(0);
   const [micLevelPct, setMicLevelPct] = useState(0);
-  const [audioInputDevices, setAudioInputDevices] = useState([]);
+  const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>(
+    []
+  );
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
   const [audioSource, setAudioSource] = useState("mic");
   const [autoVoiceSearch, setAutoVoiceSearch] = useState(true);
-  const stopMeterRef = useRef(null);
-  const meterRafRef = useRef(null);
+  const stopMeterRef = useRef<(() => void) | null>(null);
+  const meterRafRef = useRef<number | null>(null);
   const [sttMode, setSttMode] = useState("local");
   const [sttEngine, setSttEngine] = useState("");
   const [streamingAvailable, setStreamingAvailable] = useState(false);
   const [streamInterim, setStreamInterim] = useState("");
-  const [sttConfidence, setSttConfidence] = useState(null);
-  const streamWsRef = useRef(null);
-  const streamCtxRef = useRef(null);
-  const streamCleanupRef = useRef(null);
-  const [bibleVersions, setBibleVersions] = useState([]);
+  const [sttConfidence, setSttConfidence] = useState<number | null>(null);
+  const streamWsRef = useRef<WebSocket | null>(null);
+  const streamCtxRef = useRef<AudioContext | null>(null);
+  const streamCleanupRef = useRef<(() => void) | null>(null);
+  const [bibleVersions, setBibleVersions] = useState<BibleVersion[]>([]);
   const [bibleVersion, setBibleVersion] = useState("");
   const [bibleVersionName, setBibleVersionName] = useState("");
   const [bibleVersionLoading, setBibleVersionLoading] = useState(false);
   const [embeddingHint, setEmbeddingHint] = useState("");
-  const inputRef = useRef(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const listeningRef = useRef(false);
   const transcriptRef = useRef("");
   const lastPhraseSearchRef = useRef("");
-  const liveSearchAbortRef = useRef(null);
-  const liveSearchDebounceRef = useRef(null);
+  const liveSearchAbortRef = useRef<AbortController | null>(null);
+  const liveSearchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
   const previousChunkTailRef = useRef("");
-  const searchAbortRef = useRef(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
   const listenSessionRef = useRef(0);
-  const transcribeQueueRef = useRef([]);
+  const transcribeQueueRef = useRef<TranscribeJob[]>([]);
   const transcribeActiveRef = useRef(0);
-  const chunkResultsRef = useRef(new Map());
+  const chunkResultsRef = useRef<Map<number, string>>(new Map());
   const nextApplySeqRef = useRef(0);
   const chunkSeqRef = useRef(0);
-  const audioOverlapRef = useRef(null);
-  const bibleContextRef = useRef({ book: null, chapter: null });
-  const refScanDebounceRef = useRef(null);
+  const audioOverlapRef = useRef<AudioOverlap | null>(null);
+  const bibleContextRef = useRef<{
+    book: string | null;
+    chapter: number | null;
+  }>({ book: null, chapter: null });
+  const refScanDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRefScanTextRef = useRef("");
 
   async function refreshAudioDevices() {
@@ -510,21 +200,11 @@ export default function App() {
     stream.getTracks().forEach((t) => t.stop());
   }
 
-  function persistAudioPrefs(nextDeviceId, nextSource) {
-    try {
-      localStorage.setItem(
-        LS_AUDIO_KEY,
-        JSON.stringify({
-          deviceId: nextDeviceId,
-          source: nextSource,
-        })
-      );
-    } catch {
-      /* ignore */
-    }
+  function persistAudioPrefs(nextDeviceId: string, nextSource: string) {
+    saveJSON(LS_AUDIO_KEY, { deviceId: nextDeviceId, source: nextSource });
   }
 
-  function startMicLevelMeter(stream) {
+  function startMicLevelMeter(stream: MediaStream) {
     stopMeterRef.current?.();
     const audioContext = new window.AudioContext();
     const source = audioContext.createMediaStreamSource(stream);
@@ -556,7 +236,7 @@ export default function App() {
     };
   }
 
-  async function acquireListenStream(sourceMode, deviceId) {
+  async function acquireListenStream(sourceMode: string, deviceId: string) {
     if (sourceMode === "system") {
       if (!canUseSystemAudio()) {
         throw new Error(formatCaptureError({ name: "NotSupportedError" }));
@@ -585,18 +265,16 @@ export default function App() {
       return new MediaStream(audioTracks);
     }
 
-    const constraints = {
-      audio: {
-        echoCancellation: Boolean(config.echoCancellation),
-        noiseSuppression: Boolean(config.noiseSuppression),
-        autoGainControl: Boolean(config.autoGainControl),
-        channelCount: 1,
-      },
+    const audio: MediaTrackConstraints = {
+      echoCancellation: Boolean(config.echoCancellation),
+      noiseSuppression: Boolean(config.noiseSuppression),
+      autoGainControl: Boolean(config.autoGainControl),
+      channelCount: 1,
     };
     if (deviceId) {
-      constraints.audio.deviceId = { exact: deviceId };
+      audio.deviceId = { exact: deviceId };
     }
-    return navigator.mediaDevices.getUserMedia(constraints);
+    return navigator.mediaDevices.getUserMedia({ audio });
   }
 
   function clearTranscript() {
@@ -610,7 +288,7 @@ export default function App() {
   }
 
   // Ajoute une ligne horodatée au journal de transcription (affichage live).
-  function pushTranscriptSegment(text) {
+  function pushTranscriptSegment(text: string) {
     const clean = (text || "").trim();
     if (!clean) return;
     setTranscriptSegments((prev) =>
@@ -623,40 +301,32 @@ export default function App() {
 
   // Load config from localStorage on mount
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(LS_KEY);
-      if (saved) setConfig({ ...defaultConfig, ...JSON.parse(saved) });
-    } catch {}
-    try {
-      const detSaved = localStorage.getItem(LS_DETECTIONS_KEY);
-      if (detSaved) {
-        const parsed = JSON.parse(detSaved);
-        if (Array.isArray(parsed) && parsed.length) {
-          setDetections(parsed.slice(0, MAX_DETECTIONS));
-        }
+    const savedConfig = loadJSON<Partial<AppConfig> | null>(LS_KEY, null);
+    if (savedConfig) setConfig({ ...defaultConfig, ...savedConfig });
+
+    const savedDetections = loadJSON<Detection[]>(LS_DETECTIONS_KEY, []);
+    if (Array.isArray(savedDetections) && savedDetections.length) {
+      setDetections(savedDetections.slice(0, MAX_DETECTIONS));
+    }
+
+    const savedHistory = loadJSON<SentHistoryEntry[]>(LS_HISTORY_KEY, []);
+    if (Array.isArray(savedHistory) && savedHistory.length) {
+      setHistory(savedHistory.slice(0, MAX_HISTORY));
+    }
+
+    const savedAudio = loadJSON<{ deviceId?: string; source?: string } | null>(
+      LS_AUDIO_KEY,
+      null
+    );
+    if (savedAudio) {
+      const { deviceId, source } = savedAudio;
+      if (source === "system" || source === "mic") {
+        const resolved =
+          source === "system" && !canUseSystemAudio() ? "mic" : source;
+        setAudioSource(resolved);
       }
-    } catch {}
-    try {
-      const histSaved = localStorage.getItem(LS_HISTORY_KEY);
-      if (histSaved) {
-        const parsed = JSON.parse(histSaved);
-        if (Array.isArray(parsed) && parsed.length) {
-          setHistory(parsed.slice(0, MAX_HISTORY));
-        }
-      }
-    } catch {}
-    try {
-      const audioSaved = localStorage.getItem(LS_AUDIO_KEY);
-      if (audioSaved) {
-        const { deviceId, source } = JSON.parse(audioSaved);
-        if (source === "system" || source === "mic") {
-          const resolved =
-            source === "system" && !canUseSystemAudio() ? "mic" : source;
-          setAudioSource(resolved);
-        }
-        if (deviceId) setSelectedDeviceId(deviceId);
-      }
-    } catch {}
+      if (deviceId) setSelectedDeviceId(deviceId);
+    }
     inputRef.current?.focus();
 
     fetch(apiUrl("/health"))
@@ -672,7 +342,7 @@ export default function App() {
     fetch(apiUrl("/bible/versions"))
       .then((r) => r.json())
       .then((data) => {
-        const available = (data?.versions || []).filter(
+        const available = ((data?.versions || []) as BibleVersion[]).filter(
           (v) => v.available !== false && (v.verseCount || 0) > 0
         );
         if (available.length) setBibleVersions(available);
@@ -710,89 +380,14 @@ export default function App() {
 
   // Persist config changes
   useEffect(() => {
-    localStorage.setItem(LS_KEY, JSON.stringify(config));
+    saveJSON(LS_KEY, config);
   }, [config]);
 
-  // Sonde de connexion ProPresenter (état permanent dans la barre)
-  useEffect(() => {
-    let cancelled = false;
-    async function probe() {
-      if (!config.ip || !config.port) {
-        if (!cancelled) setPpConnected(null);
-        return;
-      }
-      try {
-        const params = new URLSearchParams({
-          ip: config.ip,
-          port: String(config.port),
-        });
-        const r = await fetch(apiUrl(`/propresenter/health?${params}`));
-        const data = await r.json();
-        if (!cancelled) setPpConnected(Boolean(r.ok && data.ok));
-      } catch {
-        if (!cancelled) setPpConnected(false);
-      }
-    }
-    probe();
-    const id = setInterval(probe, 15000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [config.ip, config.port]);
-
-  // Raccourcis clavier régie : 1/2/3 = afficher la suggestion, Échap = masquer
-  useEffect(() => {
-    function onKey(e) {
-      const el = e.target;
-      const tag = el?.tagName;
-      const typing =
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        tag === "SELECT" ||
-        el?.isContentEditable;
-
-      if (e.key === "Escape") {
-        if (preview) {
-          setPreview(null);
-        } else {
-          void hideProPresenter();
-        }
-        return;
-      }
-      if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
-      if (["1", "2", "3", "4", "5"].includes(e.key)) {
-        const idx = Number(e.key) - 1;
-        const hotList = [];
-        if (pinnedVerse && pinActive) hotList.push(pinnedVerse);
-        const pinKey =
-          pinnedVerse && pinActive ? verseIdentityKey(pinnedVerse) : null;
-        for (const r of results) {
-          if (verseIdentityKey(r) !== pinKey) hotList.push(r);
-        }
-        const verse = hotList[idx];
-        if (verse) {
-          e.preventDefault();
-          requestSend(verse);
-        }
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [results, pinnedVerse, pinActive, preview, config]);
-
-  function persistHistory(list) {
-    try {
-      localStorage.setItem(
-        LS_HISTORY_KEY,
-        JSON.stringify(list.slice(0, MAX_HISTORY))
-      );
-    } catch {
-      /* ignore */
-    }
+  function persistHistory(list: SentHistoryEntry[]) {
+    saveJSON(LS_HISTORY_KEY, list.slice(0, MAX_HISTORY));
   }
 
-  function recordHistory(entry) {
+  function recordHistory(entry: SentHistoryEntry) {
     setHistory((prev) => {
       const next = [entry, ...prev].slice(0, MAX_HISTORY);
       persistHistory(next);
@@ -800,22 +395,22 @@ export default function App() {
     });
   }
 
-  function getVerseVersionSlug(verse) {
+  function getVerseVersionSlug(verse: Verse | null | undefined) {
     return verse?.versionSlug || bibleVersion;
   }
 
-  function tagVersesWithSlug(verses, slug = bibleVersion) {
+  function tagVersesWithSlug(verses: Verse[], slug = bibleVersion): Verse[] {
     return verses.map((v) => ({
       ...v,
       versionSlug: v.versionSlug || slug,
     }));
   }
 
-  async function resolveVerseInVersion(coords, slug) {
+  async function resolveVerseInVersion(coords: Verse, slug: string) {
     const v = ensureVerseCoords(coords);
     const params = new URLSearchParams({
       version: slug,
-      book: v.book,
+      book: v.book ?? "",
       chapter: String(v.chapter),
       verse: String(v.verse),
     });
@@ -825,8 +420,12 @@ export default function App() {
     return data;
   }
 
-  async function loadBibleContext(verse, slug = bibleVersion, radius = CONTEXT_RADIUS) {
-    const v = ensureVerseCoords(verse);
+  async function loadBibleContext(
+    verse: Verse | VerseRef,
+    slug = bibleVersion,
+    radius = CONTEXT_RADIUS
+  ) {
+    const v = ensureVerseCoords(verse as Verse);
     if (!v.book || !v.chapter || !v.verse || !slug) {
       setBibleContext(null);
       setContextCenter(null);
@@ -857,7 +456,39 @@ export default function App() {
     }
   }
 
-  async function verseWithVersion(verse, slug) {
+  const {
+    ppConnected,
+    sending,
+    hiding,
+    lastSent,
+    demoDisplay,
+    setDemoDisplay,
+    sendToast,
+    ppStatus,
+    ppStatusLoading,
+    ppMessages,
+    ppMessagesLoading,
+    sendToProPresenter,
+    hideProPresenter,
+    testProPresenterConnection,
+    loadProPresenterMessages,
+  } = useProPresenter({
+    config,
+    setError,
+    setPinnedVerse,
+    setPinActive,
+    setLastSentVerse,
+    recordHistory,
+    loadBibleContext,
+    getVerseVersionSlug,
+    unpinGraceTimerRef,
+    onScreenCleared: () => {
+      setBibleContext(null);
+      setContextCenter(null);
+    },
+  });
+
+  async function verseWithVersion(verse: Verse, slug: string): Promise<Verse> {
     const base = ensureVerseCoords(verse);
     if (!base?.book || !slug) return verse;
     try {
@@ -875,7 +506,7 @@ export default function App() {
   }
 
   /** Change la version d'un seul verset (indépendant des autres). */
-  async function applyVerseVersion(verse, slug) {
+  async function applyVerseVersion(verse: Verse, slug: string) {
     if (!slug || !verse) return;
     const key = verseIdentityKey(verse);
     const updated = await verseWithVersion(verse, slug);
@@ -900,7 +531,11 @@ export default function App() {
   }
 
   /** Change la version globale (header) : recherche + tous les versets visibles. */
-  async function applyBibleVersion(slug, versionsList = bibleVersions, fallbackName) {
+  async function applyBibleVersion(
+    slug: string,
+    versionsList: BibleVersion[] = bibleVersions,
+    fallbackName?: string
+  ) {
     if (!slug) return;
     const found = versionsList.find((v) => v.slug === slug);
     setBibleVersion(slug);
@@ -946,13 +581,13 @@ export default function App() {
       if (data.active) setBibleVersion(data.active);
       setEmbeddingHint(data.embeddingHint || "");
     } catch (e) {
-      setError(`Bible : ${e.message}`);
+      setError(`Bible : ${errorMessage(e)}`);
     } finally {
       setBibleVersionLoading(false);
     }
   }
 
-  async function shiftBibleContext(delta) {
+  async function shiftBibleContext(delta: number) {
     if (!contextCenter) return;
     const target = contextCenter.verse + delta;
     if (target < 1) return;
@@ -973,7 +608,10 @@ export default function App() {
     }, PIN_UNPIN_GRACE_MS);
   }
 
-  function handleHypothesisAction(verse, { isPinnedSlot = false, isLive = false }) {
+  function handleHypothesisAction(
+    verse: Verse,
+    { isPinnedSlot = false, isLive = false }: { isPinnedSlot?: boolean; isLive?: boolean }
+  ) {
     if (
       isPinnedSlot &&
       isLive &&
@@ -1000,7 +638,11 @@ export default function App() {
           ]
         : [];
 
-  async function fetchVerseSuggestions(q, signal, { live = false } = {}) {
+  async function fetchVerseSuggestions(
+    q: string,
+    signal: AbortSignal,
+    { live = false }: { live?: boolean } = {}
+  ) {
     const r = await fetch(apiUrl("/search-verse"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1019,21 +661,14 @@ export default function App() {
     };
   }
 
-  function persistDetectionsList(list) {
-    try {
-      localStorage.setItem(
-        LS_DETECTIONS_KEY,
-        JSON.stringify(list.slice(0, MAX_STORED_DETECTIONS))
-      );
-    } catch {
-      /* quota */
-    }
+  function persistDetectionsList(list: Detection[]) {
+    saveJSON(LS_DETECTIONS_KEY, list.slice(0, MAX_STORED_DETECTIONS));
   }
 
-  function mergeDetectionsList(prev, fresh) {
+  function mergeDetectionsList(prev: Detection[], fresh: Detection[]): Detection[] {
     const merged = [...fresh, ...prev];
-    const seen = new Set();
-    const deduped = [];
+    const seen = new Set<string>();
+    const deduped: Detection[] = [];
     for (const item of merged) {
       const key = item.verse.reference;
       if (seen.has(key)) continue;
@@ -1045,13 +680,13 @@ export default function App() {
     return deduped;
   }
 
-  function pushDetectionEntries(entries) {
+  function pushDetectionEntries(entries: Detection[]) {
     if (!entries.length) return;
     setDetections((prev) => mergeDetectionsList(prev, entries));
   }
 
-  function pushDetections(phrase, suggestions, mode) {
-    const fresh = [];
+  function pushDetections(phrase: string, suggestions: Verse[], mode: string) {
+    const fresh: Detection[] = [];
     for (const verse of suggestions.slice(0, 3)) {
       const score = verse.score || 0;
       const tokenHits = verse.tokenHits || 0;
@@ -1089,7 +724,7 @@ export default function App() {
     pushDetectionEntries(fresh);
   }
 
-  async function scanTranscriptForReferences(snippet) {
+  async function scanTranscriptForReferences(snippet?: string) {
     const text = (snippet || transcriptRef.current || "").trim();
     if (text.length < 4) return;
     if (lastRefScanTextRef.current === text) return;
@@ -1112,7 +747,7 @@ export default function App() {
       const hits = data.hits || [];
       if (!hits.length) return;
 
-      const entries = hits.map((verse) => ({
+      const entries: Detection[] = hits.map((verse: Verse) => ({
         id: `${verse.reference}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         verse,
         phrase: verse.matchedText || text.slice(-80),
@@ -1122,8 +757,10 @@ export default function App() {
       }));
       pushDetectionEntries(entries);
       setResults((prev) => {
-        const byRef = new Map(prev.map((v) => [v.reference, v]));
-        for (const h of hits) byRef.set(h.reference, h);
+        const byRef = new Map<string, Verse>(
+          prev.map((v) => [v.reference, v] as [string, Verse])
+        );
+        for (const h of hits as Verse[]) byRef.set(h.reference, h);
         return [...byRef.values()].slice(0, 8);
       });
     } catch {
@@ -1131,7 +768,7 @@ export default function App() {
     }
   }
 
-  function scheduleReferenceScan(snippet) {
+  function scheduleReferenceScan(snippet?: string) {
     const text = (snippet || "").trim();
     if (text.length < 4) return;
     if (refScanDebounceRef.current) clearTimeout(refScanDebounceRef.current);
@@ -1141,7 +778,7 @@ export default function App() {
     }, 180);
   }
 
-  async function handleSearch(forcedQuery) {
+  async function handleSearch(forcedQuery?: string) {
     const q = (forcedQuery ?? query).trim();
     if (!q) return;
 
@@ -1159,10 +796,10 @@ export default function App() {
       setResults(tagVersesWithSlug(suggestions));
       if (!suggestions.length) setError("Aucun verset trouvé.");
     } catch (e) {
-      if (e.name === "AbortError") {
+      if ((e as Error)?.name === "AbortError") {
         return;
       }
-      setError(e.message);
+      setError(errorMessage(e));
     } finally {
       if (searchAbortRef.current === controller) {
         searchAbortRef.current = null;
@@ -1171,7 +808,7 @@ export default function App() {
     }
   }
 
-  function scheduleLiveSearch(phrase) {
+  function scheduleLiveSearch(phrase: string) {
     const normalized = phrase.trim();
     if (normalized.length < MIN_PHRASE_CHARS) return;
     if (liveSearchDebounceRef.current) {
@@ -1183,7 +820,7 @@ export default function App() {
     }, LIVE_SEARCH_DEBOUNCE_MS);
   }
 
-  async function searchFromLastPhrase(phrase) {
+  async function searchFromLastPhrase(phrase: string) {
     const normalized = phrase.trim();
     if (normalized.length < MIN_PHRASE_CHARS) return;
     if (lastPhraseSearchRef.current === normalized) return;
@@ -1205,7 +842,7 @@ export default function App() {
       if (suggestions.length) {
         // En live, on n'affiche/garde que les versets pertinents pour éviter
         // que l'écran change en permanence sur des matchs faibles.
-        const pertinent = suggestions.filter((v) => {
+        const pertinent = suggestions.filter((v: Verse) => {
           const strongRef = v.source === "reference" || v.source === "chapter";
           if (strongRef) return true;
           if (v.semanticPercent == null) return true;
@@ -1218,8 +855,8 @@ export default function App() {
         }
       }
     } catch (e) {
-      if (e.name === "AbortError") return;
-      setError(e.message);
+      if ((e as Error)?.name === "AbortError") return;
+      setError(errorMessage(e));
     } finally {
       if (liveSearchAbortRef.current === controller) {
         liveSearchAbortRef.current = null;
@@ -1228,24 +865,24 @@ export default function App() {
     }
   }
 
-  function addToQueue(verse) {
+  function addToQueue(verse: Verse) {
     setQueue((prev) => {
       if (prev.some((v) => v.reference === verse.reference)) return prev;
       return [{ ...verse, queuedAt: Date.now() }, ...prev].slice(0, MAX_QUEUE);
     });
   }
 
-  function removeFromQueue(reference) {
+  function removeFromQueue(reference: string) {
     setQueue((prev) => prev.filter((v) => v.reference !== reference));
   }
 
-  function openPreview(verse) {
-    const pages = splitVerseIntoPages(verse.text, config.verseMaxChars);
+  function openPreview(verse: Verse) {
+    const pages = splitVerseIntoPages(verse.text, Number(config.verseMaxChars));
     setPreview({ verse, pages, pageIndex: 0 });
   }
 
   // Point d'entrée des boutons "Afficher" : aperçu d'abord si activé.
-  function requestSend(verse) {
+  function requestSend(verse: Verse) {
     if (config.previewBeforeSend) {
       openPreview(verse);
       return;
@@ -1253,97 +890,16 @@ export default function App() {
     void sendToProPresenter(verse);
   }
 
-  async function sendToProPresenter(verse, overrideText) {
-    setSending(verse.reference);
-    setError("");
-    const textToSend = overrideText != null ? overrideText : verse.text;
-    try {
-      const r = await fetch(apiUrl("/send-to-propresenter"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ip: config.ip,
-          port: Number(config.port),
-          dualMessages: Boolean(config.dualMessages),
-          dualMessageOrder: config.dualMessageOrder || "verse-first",
-          messageId: config.messageId || undefined,
-          messageName: config.messageName,
-          refMessageId: config.refMessageId || undefined,
-          refMessageName: config.refMessageName,
-          refTokenName: config.refTokenName,
-          textTokenName: config.textTokenName,
-          reference: verse.reference,
-          text: textToSend,
-        }),
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || "Envoi impossible.");
-      setLastSent({
-        ref: verse.reference,
-        at: new Date(),
-        mode: data.mode || "single",
-      });
-      if (unpinGraceTimerRef.current) {
-        clearTimeout(unpinGraceTimerRef.current);
-        unpinGraceTimerRef.current = null;
-      }
-      const sent = ensureVerseCoords({
-        ...verse,
-        text: textToSend,
-        versionSlug: getVerseVersionSlug(verse),
-      });
-      setLastSentVerse(sent);
-      setPinnedVerse(sent);
-      setPinActive(true);
-      void loadBibleContext(sent, getVerseVersionSlug(sent));
-      setPpConnected(true);
-      recordHistory({
-        id: `${verse.reference}-${Date.now()}`,
-        reference: verse.reference,
-        version: verse.version || "",
-        text: textToSend,
-        at: Date.now(),
-        mode: data.mode || "single",
-      });
-    } catch (e) {
-      setError(`ProPresenter : ${e.message}`);
-    } finally {
-      setSending(null);
-    }
-  }
-
-  async function hideProPresenter() {
-    setHiding(true);
-    setError("");
-    try {
-      const r = await fetch(apiUrl("/propresenter/clear"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ip: config.ip,
-          port: Number(config.port),
-          all: true,
-        }),
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || "Masquage impossible.");
-      setPpConnected(true);
-      setLastSent(null);
-      setLastSentVerse(null);
-      setPinnedVerse(null);
-      setPinActive(false);
-      if (unpinGraceTimerRef.current) {
-        clearTimeout(unpinGraceTimerRef.current);
-        unpinGraceTimerRef.current = null;
-      }
-      setBibleContext(null);
-      setContextCenter(null);
-    } catch (e) {
-      setError(`ProPresenter : ${e.message}`);
-    } finally {
-      setHiding(false);
-    }
-  }
+  useKeyboardShortcuts({
+    results,
+    pinnedVerse,
+    pinActive,
+    preview,
+    setPreview,
+    requestSend,
+    hideProPresenter,
+    setConfig,
+  });
 
   function sendPreviewPage() {
     if (!preview) return;
@@ -1351,14 +907,14 @@ export default function App() {
     void sendToProPresenter(preview.verse, text);
   }
 
-  function onKeyDown(e) {
+  function onKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSearch();
     }
   }
 
-  function runLiveDetectionIfNeeded(transcript, addition = "") {
+  function runLiveDetectionIfNeeded(transcript: string, addition = "") {
     const phrase = extractLastPhrase(transcript);
     setLastPhrase(phrase);
     if (!autoVoiceSearch) return;
@@ -1377,7 +933,7 @@ export default function App() {
     refreshLiveTranscriptLine(pending);
   }
 
-  function refreshLiveTranscriptLine(pendingOverride) {
+  function refreshLiveTranscriptLine(pendingOverride?: number) {
     if (!listeningRef.current) return;
     const pending =
       pendingOverride ??
@@ -1415,7 +971,7 @@ export default function App() {
     updateTranscribePendingUi();
   }
 
-  function mergeTranscriptAddition(text) {
+  function mergeTranscriptAddition(text: string): boolean {
     if (isSttPromptEchoText(text)) return false;
     const newWords = text.split(/\s+/).filter(Boolean);
     const transcriptWords = transcriptRef.current.split(/\s+/).filter(Boolean);
@@ -1449,7 +1005,7 @@ export default function App() {
     return true;
   }
 
-  function applyChunkResult(seq, text) {
+  function applyChunkResult(seq: number, text: string) {
     chunkResultsRef.current.set(seq, text ?? "");
     while (chunkResultsRef.current.has(nextApplySeqRef.current)) {
       const chunkText = chunkResultsRef.current.get(nextApplySeqRef.current);
@@ -1459,15 +1015,15 @@ export default function App() {
     }
   }
 
-  async function runTranscriptionJob({ wavBlob, sessionId, seq }) {
+  async function runTranscriptionJob({ wavBlob, sessionId, seq }: TranscribeJob) {
     try {
       const text = await transcribeAudio(wavBlob);
       if (sessionId !== listenSessionRef.current) return;
       applyChunkResult(seq, text || "");
     } catch (e) {
       if (sessionId !== listenSessionRef.current) return;
-      if (e.name === "AbortError") return;
-      setError(`Dictée : ${e.message}`);
+      if ((e as Error)?.name === "AbortError") return;
+      setError(`Dictée : ${errorMessage(e)}`);
       listeningRef.current = false;
       setIsListening(false);
     }
@@ -1479,6 +1035,7 @@ export default function App() {
       transcribeQueueRef.current.length > 0
     ) {
       const job = transcribeQueueRef.current.shift();
+      if (!job) break;
       transcribeActiveRef.current += 1;
       updateTranscribePendingUi();
       void runTranscriptionJob(job).finally(() => {
@@ -1489,7 +1046,7 @@ export default function App() {
     }
   }
 
-  function scheduleTranscription(wavBlob, sessionId) {
+  function scheduleTranscription(wavBlob: Blob, sessionId: number) {
     const pending =
       transcribeActiveRef.current + transcribeQueueRef.current.length;
     if (pending >= TRANSCRIBE_MAX_PENDING) {
@@ -1517,7 +1074,7 @@ export default function App() {
     resetTranscribePipeline();
   }
 
-  function floatTo16BitPCM(float32Array) {
+  function floatTo16BitPCM(float32Array: Float32Array) {
     const buffer = new ArrayBuffer(float32Array.length * 2);
     const view = new DataView(buffer);
     let offset = 0;
@@ -1529,12 +1086,12 @@ export default function App() {
     return new Uint8Array(buffer);
   }
 
-  function encodeWav(samplesFloat32, sampleRate) {
+  function encodeWav(samplesFloat32: Float32Array, sampleRate: number) {
     const pcm = floatTo16BitPCM(samplesFloat32);
     const wavBuffer = new ArrayBuffer(44 + pcm.length);
     const view = new DataView(wavBuffer);
 
-    const writeString = (offset, value) => {
+    const writeString = (offset: number, value: string) => {
       for (let i = 0; i < value.length; i += 1) {
         view.setUint8(offset + i, value.charCodeAt(i));
       }
@@ -1559,17 +1116,17 @@ export default function App() {
   }
 
   async function captureWavChunk(
-    stream,
+    stream: MediaStream,
     durationMs = VOICE_CHUNK_MS,
     minAvgRms = VAD_MIN_AVG_RMS,
-    overlapPrefix = null,
+    overlapPrefix: AudioOverlap | null = null,
     overlapMs = VOICE_OVERLAP_MS
   ) {
     const audioContext = new window.AudioContext();
     const sampleRate = audioContext.sampleRate;
     const source = audioContext.createMediaStreamSource(stream);
     const processor = audioContext.createScriptProcessor(4096, 1, 1);
-    const chunks = [];
+    const chunks: Float32Array[] = [];
     let totalFrames = 0;
     let speechFrames = 0;
     let rmsSum = 0;
@@ -1604,7 +1161,7 @@ export default function App() {
     // Attend jusqu'à durationMs, mais coupe plus tôt si pause après de la parole.
     const frameMs = (frameSamples / sampleRate) * 1000;
     const startedAt = Date.now();
-    await new Promise((resolve) => {
+    await new Promise<void>((resolve) => {
       const check = () => {
         const elapsed = Date.now() - startedAt;
         if (elapsed >= durationMs) return resolve();
@@ -1678,7 +1235,7 @@ export default function App() {
     };
   }
 
-  async function blobToBase64(blob) {
+  async function blobToBase64(blob: Blob) {
     const arrayBuffer = await blob.arrayBuffer();
     let binary = "";
     const bytes = new Uint8Array(arrayBuffer);
@@ -1688,7 +1245,7 @@ export default function App() {
     return btoa(binary);
   }
 
-  async function transcribeAudio(wavBlob) {
+  async function transcribeAudio(wavBlob: Blob) {
     const audioBase64 = await blobToBase64(wavBlob);
     const r = await fetch(apiUrl("/transcribe"), {
       method: "POST",
@@ -1722,7 +1279,7 @@ export default function App() {
       setError("Micro non supporte sur cet appareil.");
       return;
     }
-    let stream;
+    let stream: MediaStream | undefined;
     try {
       stream = await acquireListenStream(audioSource, selectedDeviceId);
       startMicLevelMeter(stream);
@@ -1770,7 +1327,7 @@ export default function App() {
     }
   }
 
-  function handleStreamInterim(text) {
+  function handleStreamInterim(text: string) {
     setStreamInterim(text);
     // Sur l'interim (qui change en continu) : seulement la détection de
     // références directes (locale, instantanée). La recherche sémantique ne
@@ -1780,7 +1337,7 @@ export default function App() {
     scheduleReferenceScan(text);
   }
 
-  function appendStreamingFinal(text) {
+  function appendStreamingFinal(text: string) {
     const clean = (text || "").trim();
     setStreamInterim("");
     if (!clean) return;
@@ -1796,7 +1353,7 @@ export default function App() {
   }
 
   async function startStreamingRecognition() {
-    let stream;
+    let stream: MediaStream;
     try {
       stream = await acquireListenStream(audioSource, selectedDeviceId);
     } catch (e) {
@@ -1817,8 +1374,8 @@ export default function App() {
       Math.min(3, (Number(config.inputGain) || 100) / 100)
     );
 
-    let workletNode = null;
-    let ws = null;
+    let workletNode: AudioWorkletNode | null = null;
+    let ws: WebSocket | null = null;
     let closed = false;
 
     const cleanup = () => {
@@ -1982,29 +1539,7 @@ export default function App() {
   const showInterimStatus =
     !fullTranscript.trim() && Boolean(liveTranscript.trim());
 
-  async function testProPresenterConnection() {
-    setPpStatusLoading(true);
-    try {
-      const params = new URLSearchParams({
-        ip: config.ip,
-        port: String(config.port),
-      });
-      const r = await fetch(apiUrl(`/propresenter/health?${params.toString()}`));
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || "Connexion impossible.");
-      setPpStatus({
-        ok: true,
-        message: `Connecté (${config.ip}:${config.port})`,
-        version: data.version,
-      });
-    } catch (e) {
-      setPpStatus({ ok: false, message: e.message, version: null });
-    } finally {
-      setPpStatusLoading(false);
-    }
-  }
-
-  function dismissResult(verseOrIdx) {
+  function dismissResult(verseOrIdx: number | Verse) {
     if (typeof verseOrIdx === "number") {
       setResults((prev) => prev.filter((_, i) => i !== verseOrIdx));
       return;
@@ -2044,139 +1579,15 @@ export default function App() {
     (r) => verseIdentityKey(r) !== pinnedKey
   );
 
-  function renderHypothesisCard(
-    verse,
-    { listIndex, isPinnedSlot = false, isLive = false }
-  ) {
-    const scoreNum = isLive ? 100 : verseScoreNumber(verse);
-    const tier = confidenceTier(scoreNum);
-    const verseSlug = getVerseVersionSlug(verse);
-    return (
-      <article
-        key={`${verseIdentityKey(verse)}-${isPinnedSlot ? "pin" : listIndex}`}
-        className={`hyp-card ${isPinnedSlot ? "is-pinned" : ""} ${
-          isPinnedSlot && !isLive ? "is-pinned-grace" : ""
-        } tier-${isLive ? "confirmed" : tier.key}`}
-      >
-        <div className="hyp-rank">{isPinnedSlot ? "▶" : listIndex + 1}</div>
-        <div className="hyp-body">
-          <div className="hyp-top">
-            <div className="hyp-ref-block">
-              <h2 className="hyp-ref">{verse.reference}</h2>
-              <select
-                className="hyp-version-select"
-                value={verseSlug}
-                disabled={bibleVersionLoading}
-                onChange={(e) => void applyVerseVersion(verse, e.target.value)}
-                title="Version biblique de ce verset"
-              >
-                {bibleVersionOptions.map((opt) => (
-                  <option key={opt.slug} value={opt.slug}>
-                    {opt.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <span className={`hyp-status tier-${isLive ? "confirmed" : tier.key}`}>
-              {isLive ? "En direct" : isPinnedSlot ? "Récent" : tier.label}
-              <strong>{scoreNum}/100</strong>
-            </span>
-          </div>
-          <div className="hyp-score-track" aria-hidden="true">
-            <div
-              className="hyp-score-fill"
-              style={{ width: `${scoreNum}%` }}
-            />
-          </div>
-          <p className="hyp-text">{verse.text}</p>
-          <div className="hyp-footer">
-            <div className="hyp-tags">
-              {verseTags(verse).map((t) => (
-                <span key={t} className="hyp-tag">
-                  {t}
-                </span>
-              ))}
-            </div>
-            <div className="hyp-actions">
-              {!isPinnedSlot && (
-                <button
-                  className="hyp-reject"
-                  title="Rejeter cette hypothèse"
-                  type="button"
-                  onClick={() => dismissResult(verse)}
-                >
-                  ✕
-                </button>
-              )}
-              {isPinnedSlot && !isLive && (
-                <button
-                  className="hyp-reject"
-                  title="Retirer maintenant"
-                  type="button"
-                  onClick={() => {
-                    if (unpinGraceTimerRef.current) {
-                      clearTimeout(unpinGraceTimerRef.current);
-                    }
-                    setPinnedVerse(null);
-                  }}
-                >
-                  ✕
-                </button>
-              )}
-              <button
-                className={`hyp-send ${
-                  isLive ? "is-live" : `tier-${tier.key}`
-                }`}
-                onClick={() =>
-                  handleHypothesisAction(verse, { isPinnedSlot, isLive })
-                }
-                disabled={sending === verse.reference}
-                title={
-                  isLive
-                    ? "Désépingler (le verset reste visible un moment)"
-                    : "Afficher à l'écran"
-                }
-              >
-                {sending === verse.reference
-                  ? "Envoi…"
-                  : isLive
-                    ? "Live"
-                    : "Afficher"}
-                <span className="arrow">→</span>
-                {listIndex < 5 && (
-                  <kbd className="send-kbd">{listIndex + 1}</kbd>
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
-      </article>
-    );
-  }
-
-  async function loadProPresenterMessages() {
-    setPpMessagesLoading(true);
-    try {
-      const params = new URLSearchParams({
-        ip: config.ip,
-        port: String(config.port),
-      });
-      const r = await fetch(
-        apiUrl(`/propresenter/messages?${params.toString()}`)
-      );
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || "Chargement impossible.");
-      setPpMessages(data.messages || []);
-    } catch (e) {
-      setError(`ProPresenter : ${e.message}`);
-      setPpMessages([]);
-    } finally {
-      setPpMessagesLoading(false);
+  function handleUnpinPinned() {
+    if (unpinGraceTimerRef.current) {
+      clearTimeout(unpinGraceTimerRef.current);
     }
+    setPinnedVerse(null);
   }
 
   return (
-    <div className="app">
+    <div className={`app ${config.liveMode ? "live-mode" : ""}`}>
       <div className="grid-bg" aria-hidden="true" />
 
       <header className="topbar">
@@ -2238,14 +1649,16 @@ export default function App() {
           >
             {hiding ? "…" : "Masquer"}
           </button>
-          <button
-            className="icon-btn"
-            onClick={() => setShowConfig((v) => !v)}
-            aria-label="Configuration ProPresenter"
-            title="Configuration ProPresenter"
-          >
-            ⚙
-          </button>
+          <ProPresenterSettings
+            config={config}
+            onToggleDemo={() =>
+              setConfig((c) => ({ ...c, demoMode: !c.demoMode }))
+            }
+            onToggleLive={() =>
+              setConfig((c) => ({ ...c, liveMode: !c.liveMode }))
+            }
+            onOpenConfig={() => setShowConfig((v) => !v)}
+          />
         </div>
       </header>
 
@@ -2271,329 +1684,42 @@ export default function App() {
 
       <main className="main board">
           <aside className="col-left">
-          <section className="panel live-panel">
-            <div className="panel-head">
-              <span className="panel-hint">Transcription live</span>
-              {streamingAvailable && config.streaming && (
-                <span className="live-stream-tag">
-                  <span className="live-stream-dot" /> streaming
-                </span>
-              )}
-            </div>
-
-            <button
-              className={`live-start-btn ${isListening ? "is-live" : ""}`}
-              onClick={toggleVoiceRecognition}
-              disabled={!speechSupported}
-              type="button"
-            >
-              {isListening ? "■ Arrêter le live" : "▶ Démarrer le live"}
-            </button>
-            <div className="live-engine-row">
-              <span className="live-engine-name">
-                {config.streaming && streamingAvailable
-                  ? "Deepgram"
-                  : `STT ${sttMode}`}
-                {bibleVersionName ? ` · ${bibleVersionName}` : ""}
-                {sttEngine ? ` · ${sttEngine}` : ""}
-              </span>
-              <button
-                type="button"
-                className="panel-link-btn"
-                onClick={clearTranscript}
-                disabled={!fullTranscript.trim() && !liveTranscript.trim()}
-                title="Réinitialiser la transcription"
-              >
-                Réinitialiser
-              </button>
-            </div>
-
-            <details className="audio-controls audio-settings">
-              <summary>Réglages audio &amp; moteur</summary>
-              <div className="audio-source-row">
-                <span className="audio-controls-label">Source audio</span>
-                <label className="audio-source-option">
-                  <input
-                    type="radio"
-                    name="audio-source"
-                    value="mic"
-                    checked={audioSource === "mic"}
-                    disabled={isListening}
-                    onChange={() => {
-                      setAudioSource("mic");
-                      persistAudioPrefs(selectedDeviceId, "mic");
-                    }}
-                  />
-                  Micro
-                </label>
-                <label
-                  className={`audio-source-option ${
-                    !canUseSystemAudio() ? "is-disabled" : ""
-                  }`}
-                  title={
-                    !canUseSystemAudio()
-                      ? "Non supporté dans Safari — utilise Chrome ou Electron"
-                      : ""
-                  }
-                >
-                  <input
-                    type="radio"
-                    name="audio-source"
-                    value="system"
-                    checked={audioSource === "system"}
-                    disabled={isListening || !canUseSystemAudio()}
-                    onChange={() => {
-                      setAudioSource("system");
-                      persistAudioPrefs(selectedDeviceId, "system");
-                    }}
-                  />
-                  Son système
-                </label>
-              </div>
-
-              {!window.versepilotDesktop?.isDesktop && (
-                <p className="audio-system-hint audio-system-warn">
-                  Son système : ouvre la <strong>fenêtre Electron</strong> lancée par{" "}
-                  <strong>npm run dev</strong> (pas seulement l’onglet Chrome à
-                  localhost:5173).
-                </p>
-              )}
-              {!canUseSystemAudio() && (
-                <p className="audio-system-hint audio-system-warn">
-                  Safari ne gère pas le son système. Utilise la fenêtre Electron ou
-                  Chrome.
-                </p>
-              )}
-
-              {audioSource === "mic" && (
-                <div className="audio-device-row">
-                  <label className="audio-controls-label" htmlFor="audio-input-device">
-                    Microphone
-                  </label>
-                  <select
-                    id="audio-input-device"
-                    className="audio-device-select"
-                    value={selectedDeviceId}
-                    disabled={isListening || !audioInputDevices.length}
-                    onChange={(e) => {
-                      setSelectedDeviceId(e.target.value);
-                      persistAudioPrefs(e.target.value, audioSource);
-                    }}
-                  >
-                    <option value="">Par défaut (système)</option>
-                    {audioInputDevices.map((d) => (
-                      <option key={d.deviceId} value={d.deviceId}>
-                        {d.label || `Micro ${d.deviceId.slice(0, 8)}…`}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
-
-              {audioSource === "system" && canUseSystemAudio() && (
-                <p className="audio-system-hint">
-                  Clique <strong>Dicter</strong> → dialogue macOS : <strong>Écran entier</strong>{" "}
-                  + <strong>« Partager l’audio du Mac »</strong>. Lance une vidéo ou Zoom pour
-                  tester : la barre verte doit bouger. Plan B : <strong>Micro</strong> + BlackHole.
-                </p>
-              )}
-
-              <div className="mic-level-block">
-                <div className="mic-level-header">
-                  <span className="audio-controls-label">Niveau audio</span>
-                  <span
-                    className={
-                      micLevelPct >= MIC_LEVEL_MIN_SPEECH
-                        ? "mic-level-status ok"
-                        : "mic-level-status"
-                    }
-                  >
-                    {isListening
-                      ? micLevelPct >= MIC_LEVEL_MIN_SPEECH
-                        ? "Signal OK"
-                        : "Parle plus fort"
-                      : "En attente"}
-                  </span>
-                </div>
-                <div className="mic-level-track" aria-hidden="true">
-                  <div
-                    className={`mic-level-fill ${
-                      micLevelPct >= MIC_LEVEL_MIN_SPEECH ? "is-hot" : ""
-                    }`}
-                    style={{ width: `${micLevelPct}%` }}
-                  />
-                  <div
-                    className="mic-level-threshold"
-                    style={{ left: `${MIC_LEVEL_MIN_SPEECH}%` }}
-                  />
-                </div>
-              </div>
-
-              <div className="stt-settings">
-                <label
-                  className={`stt-stream-toggle ${
-                    !streamingAvailable ? "is-disabled" : ""
-                  }`}
-                  title={
-                    streamingAvailable
-                      ? "Transcription en continu (Deepgram), plus rapide et précise"
-                      : "Nécessite une clé Deepgram (DEEPGRAM_API_KEY)"
-                  }
-                >
-                  <input
-                    type="checkbox"
-                    checked={Boolean(config.streaming) && streamingAvailable}
-                    disabled={!streamingAvailable || isListening}
-                    onChange={(e) =>
-                      setConfig({ ...config, streaming: e.target.checked })
-                    }
-                  />
-                  Temps réel (streaming)
-                  {config.streaming && streamingAvailable && (
-                    <span className="stt-stream-badge">LIVE</span>
-                  )}
-                </label>
-
-                {sttConfidence != null && isListening && (
-                  <span
-                    className={`stt-confidence ${
-                      sttConfidence >= 0.8
-                        ? "high"
-                        : sttConfidence >= 0.6
-                        ? "mid"
-                        : "low"
-                    }`}
-                    title="Confiance de la transcription"
-                  >
-                    {Math.round(sttConfidence * 100)}%
-                  </span>
-                )}
-
-                <div className="stt-gain-row">
-                  <span className="audio-controls-label">Gain</span>
-                  <input
-                    type="range"
-                    min="50"
-                    max="250"
-                    step="10"
-                    value={config.inputGain}
-                    onChange={(e) =>
-                      setConfig({ ...config, inputGain: Number(e.target.value) })
-                    }
-                  />
-                  <span className="stt-gain-val">{config.inputGain}%</span>
-                </div>
-
-                <div className="stt-dsp-row">
-                  <label title="Réduction de bruit du navigateur — à désactiver sur un feed propre de console">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(config.noiseSuppression)}
-                      disabled={isListening}
-                      onChange={(e) =>
-                        setConfig({
-                          ...config,
-                          noiseSuppression: e.target.checked,
-                        })
-                      }
-                    />
-                    Anti-bruit
-                  </label>
-                  <label title="Annulation d'écho — utile au micro laptop, à couper sur feed direct">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(config.echoCancellation)}
-                      disabled={isListening}
-                      onChange={(e) =>
-                        setConfig({
-                          ...config,
-                          echoCancellation: e.target.checked,
-                        })
-                      }
-                    />
-                    Anti-écho
-                  </label>
-                  <label title="Gain automatique du navigateur">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(config.autoGainControl)}
-                      disabled={isListening}
-                      onChange={(e) =>
-                        setConfig({
-                          ...config,
-                          autoGainControl: e.target.checked,
-                        })
-                      }
-                    />
-                    Gain auto
-                  </label>
-                </div>
-              </div>
-            </details>
-
-            <div className="live-transcript-box">
-              {transcriptSegments.length === 0 &&
-              !streamInterim &&
-              !(showInterimStatus && liveTranscript) ? (
-                <p className="live-transcript-placeholder">
-                  Démarre le live pour transcrire la prédication en direct.
-                </p>
-              ) : (
-                <div className="transcript-feed">
-                  {transcriptSegments.map((seg) => (
-                    <div key={seg.id} className="transcript-line">
-                      <span className="transcript-time">
-                        {formatDetectionTime(seg.at)}
-                      </span>
-                      <span className="transcript-said">{seg.text}</span>
-                    </div>
-                  ))}
-                  {(streamInterim || (showInterimStatus && liveTranscript)) && (
-                    <div className="transcript-line is-pending">
-                      <span className="transcript-time">live</span>
-                      <span className="transcript-said">
-                        {streamInterim || liveTranscript}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-            <div className="voice-hint-row">
-              {speechSupported ? (
-                <>
-                  {isListening
-                    ? config.streaming && streamingAvailable
-                      ? "Écoute active · temps réel (Deepgram)"
-                      : isTranscribing
-                        ? `Écoute · ${pendingTranscriptions} transcription(s) en file`
-                        : `Écoute active · STT ${sttMode}`
-                    : isTranscribing
-                      ? `Finalisation (${pendingTranscriptions})...`
-                      : `Dictée prête · STT ${sttMode}`}{" "}
-                {bibleVersionName ? `· ${bibleVersionName}` : ""}{" "}
-                  {sttEngine ? `· moteur ${sttEngine}` : ""}
-                  {liveSearching ? " · détection..." : ""} ·
-                  <label className="voice-toggle">
-                    <input
-                      type="checkbox"
-                      checked={autoVoiceSearch}
-                      onChange={(e) => setAutoVoiceSearch(e.target.checked)}
-                    />
-                    Détection auto (dernière phrase)
-                  </label>
-                </>
-              ) : (
-                "Dictée non supportée sur cet environnement."
-              )}
-            </div>
-            {lastPhrase && isListening && (
-              <p className="last-phrase-hint">
-                Dernière phrase analysée :{" "}
-                <em>&ldquo;{lastPhrase}&rdquo;</em>
-              </p>
-            )}
-          </section>
+          <LiveTranscription
+            config={config}
+            setConfig={setConfig}
+            isListening={isListening}
+            speechSupported={speechSupported}
+            liveTranscript={liveTranscript}
+            fullTranscript={fullTranscript}
+            showInterimStatus={showInterimStatus}
+            streamInterim={streamInterim}
+            transcriptSegments={transcriptSegments}
+            streamingAvailable={streamingAvailable}
+            sttMode={sttMode}
+            sttEngine={sttEngine}
+            bibleVersionName={bibleVersionName}
+            sttConfidence={sttConfidence}
+            isTranscribing={isTranscribing}
+            pendingTranscriptions={pendingTranscriptions}
+            liveSearching={liveSearching}
+            autoVoiceSearch={autoVoiceSearch}
+            lastPhrase={lastPhrase}
+            audioSource={audioSource}
+            selectedDeviceId={selectedDeviceId}
+            audioInputDevices={audioInputDevices}
+            micLevelPct={micLevelPct}
+            onToggleLive={toggleVoiceRecognition}
+            onClear={clearTranscript}
+            onAudioSourceChange={(source) => {
+              setAudioSource(source);
+              persistAudioPrefs(selectedDeviceId, source);
+            }}
+            onDeviceChange={(deviceId) => {
+              setSelectedDeviceId(deviceId);
+              persistAudioPrefs(deviceId, audioSource);
+            }}
+            onAutoVoiceSearchChange={setAutoVoiceSearch}
+          />
 
           <section className="panel detections-panel">
             <div className="panel-head">
@@ -2726,108 +1852,37 @@ export default function App() {
           </section>
           </aside>
 
-        <div className="search-block col-search">
-          <label className="search-label" htmlFor="q">
-            <span className="search-hint">Recherche manuelle</span>
-            <span className="search-sub">
-              Référence, citation approximative ou mot-clé
-            </span>
-          </label>
-          {bibleVersionOptions.length > 0 && (
-            <div className="bible-version-row">
-              <label className="bible-version-label" htmlFor="search-bible-version">
-                Version biblique
-              </label>
-              <select
-                id="search-bible-version"
-                className="bible-version-select"
-                value={bibleVersion}
-                disabled={bibleVersionLoading}
-                onChange={(e) => applyBibleVersion(e.target.value)}
-              >
-                {bibleVersionOptions.map((v) => (
-                  <option key={v.slug} value={v.slug}>
-                    {v.name}
-                    {v.verseCount ? ` (${v.verseCount} versets)` : ""}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          <div className="search-row">
-            <textarea
-              id="q"
-              ref={inputRef}
-              className="search-input"
-              placeholder='"jean 3 16"   ·   "celui qui croit en moi aura la vie"   ·   "berger"'
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={onKeyDown}
-              rows={2}
-            />
-            <button
-              className="search-btn"
-              onClick={handleSearch}
-              disabled={loading || !query.trim()}
-            >
-              {loading ? (
-                <span className="spinner" aria-hidden="true" />
-              ) : (
-                <>Rechercher <span className="arrow">→</span></>
-              )}
-            </button>
-          </div>
-          <div className="hint-row">
-            <kbd>↵</kbd> pour lancer · <kbd>⇧</kbd> + <kbd>↵</kbd> nouvelle ligne
-          </div>
-        </div>
-
+        <SearchPanel
+          query={query}
+          loading={loading}
+          bibleVersion={bibleVersion}
+          bibleVersionLoading={bibleVersionLoading}
+          bibleVersionOptions={bibleVersionOptions}
+          inputRef={inputRef}
+          onQueryChange={setQuery}
+          onSearch={handleSearch}
+          onKeyDown={onKeyDown}
+          onBibleVersionChange={(slug) => void applyBibleVersion(slug)}
+        />
         {error && <div className="error">⚠ {error}</div>}
 
-          <section className="results panel-suggestions col-hyp">
-            <div className="results-header">
-              <span className="results-hint">Hypothèses</span>
-              <span className="results-count">
-                {liveSearching
-                  ? "détection…"
-                  : `${results.length} résultat${
-                      results.length > 1 ? "s" : ""
-                    }`}
-              </span>
-            </div>
-
-            <div className="results-list">
-            {pinnedVerse &&
-              renderHypothesisCard(pinnedVerse, {
-                listIndex: 0,
-                isPinnedSlot: true,
-                isLive: pinActive,
-              })}
-            {resultsBelow.map((verse, idx) =>
-              renderHypothesisCard(verse, {
-                listIndex: pinnedVerse ? idx + 1 : idx,
-                isPinnedSlot: false,
-                isLive: false,
-              })
-            )}
-
-            {!loading &&
-              !liveSearching &&
-              !pinnedVerse &&
-              results.length === 0 &&
-              !error && (
-              <div className="empty">
-                <div className="empty-mark">⌖</div>
-                <p>
-                  {isListening
-                    ? "En attente de la prochaine phrase détectée…"
-                    : "En attente d'une recherche."}
-                </p>
-              </div>
-            )}
-            </div>
-          </section>
-
+          <HypothesisList
+            pinnedVerse={pinnedVerse}
+            pinActive={pinActive}
+            resultsBelow={resultsBelow}
+            loading={loading}
+            liveSearching={liveSearching}
+            error={error}
+            isListening={isListening}
+            sendingRef={sending}
+            bibleVersionLoading={bibleVersionLoading}
+            bibleVersionOptions={bibleVersionOptions}
+            onApplyVersion={(verse, slug) => void applyVerseVersion(verse, slug)}
+            onDismiss={dismissResult}
+            onUnpin={handleUnpinPinned}
+            onAction={handleHypothesisAction}
+            getVerseVersionSlug={(verse) => getVerseVersionSlug(verse)}
+          />
           <aside className="col-right">
           <section className="panel pp-apercu">
             <div className="panel-head">
@@ -2916,7 +1971,7 @@ export default function App() {
               )}
             </div>
 
-            {(contextCenter || bibleContext?.verses?.length > 0) && (
+            {(contextCenter || (bibleContext?.verses?.length ?? 0) > 0) && (
               <div className="context-nav">
                 <button
                   type="button"
@@ -3010,6 +2065,9 @@ export default function App() {
                 <div key={h.id} className="history-item">
                   <div className="history-main">
                     <strong>{h.reference}</strong>
+                    {h.serviceName && (
+                      <span className="history-service">{h.serviceName}</span>
+                    )}
                     <span className="history-snippet">
                       {h.text.slice(0, 64)}
                       {h.text.length > 64 ? "…" : ""}
@@ -3071,10 +2129,9 @@ export default function App() {
                     className="ghost-btn"
                     disabled={preview.pageIndex === 0}
                     onClick={() =>
-                      setPreview((p) => ({
-                        ...p,
-                        pageIndex: Math.max(0, p.pageIndex - 1),
-                      }))
+                      setPreview((p) =>
+                        p ? { ...p, pageIndex: Math.max(0, p.pageIndex - 1) } : p
+                      )
                     }
                   >
                     ‹
@@ -3087,13 +2144,14 @@ export default function App() {
                     className="ghost-btn"
                     disabled={preview.pageIndex >= preview.pages.length - 1}
                     onClick={() =>
-                      setPreview((p) => ({
-                        ...p,
-                        pageIndex: Math.min(
-                          p.pages.length - 1,
-                          p.pageIndex + 1
-                        ),
-                      }))
+                      setPreview((p) =>
+                        p
+                          ? {
+                              ...p,
+                              pageIndex: Math.min(p.pages.length - 1, p.pageIndex + 1),
+                            }
+                          : p
+                      )
                     }
                   >
                     ›
@@ -3142,272 +2200,27 @@ export default function App() {
           ProPresenter <code>{config.ip}:{config.port}</code>
         </span>
       </footer>
+
+      {sendToast && (
+        <div className="send-toast" role="status">
+          ✓ <strong>{sendToast.ref}</strong> affiché
+          {config.demoMode ? " (démo)" : ""}
+        </div>
+      )}
+
+      {demoDisplay && (
+        <DemoScreen
+          verse={demoDisplay.verse}
+          mode={demoDisplay.mode}
+          fullscreen={demoFullscreen}
+          onToggleFullscreen={() => setDemoFullscreen((v) => !v)}
+          onClose={() => {
+            setDemoDisplay(null);
+            setDemoFullscreen(false);
+          }}
+        />
+      )}
     </div>
   );
 }
 
-function ConfigPanel({
-  config,
-  setConfig,
-  ppStatus,
-  ppStatusLoading,
-  ppMessages,
-  ppMessagesLoading,
-  onTestConnection,
-  onLoadMessages,
-  onClose,
-}) {
-  return (
-    <div className="config-overlay" onClick={onClose}>
-      <div className="config-panel" onClick={(e) => e.stopPropagation()}>
-        <div className="config-header">
-          <h3>Connexion ProPresenter</h3>
-          <button className="icon-btn" onClick={onClose}>
-            ✕
-          </button>
-        </div>
-        <label className="config-toggle field-full">
-          <input
-            type="checkbox"
-            checked={Boolean(config.dualMessages)}
-            onChange={(e) =>
-              setConfig({ ...config, dualMessages: e.target.checked })
-            }
-          />
-          <span>Deux messages séparés (référence + verset)</span>
-        </label>
-        <label className="config-toggle field-full">
-          <input
-            type="checkbox"
-            checked={Boolean(config.previewBeforeSend)}
-            onChange={(e) =>
-              setConfig({ ...config, previewBeforeSend: e.target.checked })
-            }
-          />
-          <span>Aperçu avant envoi (+ pagination des versets longs)</span>
-        </label>
-        <div className="config-grid">
-          <Field
-            label="Adresse IP"
-            value={config.ip}
-            onChange={(v) => setConfig({ ...config, ip: v })}
-            placeholder="127.0.0.1"
-            mono
-          />
-          <Field
-            label="Port"
-            value={config.port}
-            onChange={(v) => setConfig({ ...config, port: v })}
-            placeholder="50001"
-            mono
-          />
-          {config.dualMessages ? (
-            <>
-          <Field
-                label="Message référence"
-                value={config.refMessageName}
-                onChange={(v) => setConfig({ ...config, refMessageName: v })}
-                placeholder="Reference"
-              />
-              <Field
-                label="ID message réf. (opt.)"
-                value={config.refMessageId}
-                onChange={(v) => setConfig({ ...config, refMessageId: v })}
-                placeholder="uuid"
-                mono
-              />
-              <Field
-                label="Message verset"
-            value={config.messageName}
-            onChange={(v) => setConfig({ ...config, messageName: v })}
-            placeholder="Verset"
-          />
-              <Field
-                label="ID message verset (opt.)"
-                value={config.messageId}
-                onChange={(v) => setConfig({ ...config, messageId: v })}
-                placeholder="uuid"
-                mono
-              />
-              <label className="field field-full">
-                <span className="field-label">Ordre d&apos;affichage (dual)</span>
-                <select
-                  className="field-input"
-                  value={config.dualMessageOrder || "verse-first"}
-                  onChange={(e) =>
-                    setConfig({ ...config, dualMessageOrder: e.target.value })
-                  }
-                >
-                  <option value="verse-first">
-                    Verset puis référence (réf. par-dessus)
-                  </option>
-                  <option value="reference-first">
-                    Référence puis verset
-                  </option>
-                </select>
-              </label>
-            </>
-          ) : (
-            <>
-              <Field
-                label="Nom du message"
-                value={config.messageName}
-                onChange={(v) => setConfig({ ...config, messageName: v })}
-                placeholder="Verset"
-              />
-              <Field
-                label="Message ID (optionnel)"
-                value={config.messageId}
-                onChange={(v) => setConfig({ ...config, messageId: v })}
-                placeholder="uuid du message"
-                mono
-              />
-            </>
-          )}
-          <Field
-            label="Token : référence"
-            value={config.refTokenName}
-            onChange={(v) => setConfig({ ...config, refTokenName: v })}
-            placeholder="Reference"
-            mono
-          />
-          <Field
-            label="Token : verset"
-            value={config.textTokenName}
-            onChange={(v) => setConfig({ ...config, textTokenName: v })}
-            placeholder="Verset"
-            mono
-          />
-          <Field
-            label="Longueur max / page"
-            value={config.verseMaxChars}
-            onChange={(v) =>
-              setConfig({
-                ...config,
-                verseMaxChars: v.replace(/[^0-9]/g, "") || "",
-              })
-            }
-            placeholder="220"
-            mono
-          />
-        </div>
-        <div className="config-actions">
-          <button className="send-btn" onClick={onTestConnection}>
-            {ppStatusLoading ? "Test..." : "Tester la connexion"}
-          </button>
-          <button className="send-btn" onClick={onLoadMessages}>
-            {ppMessagesLoading ? "Chargement..." : "Charger les messages"}
-          </button>
-        </div>
-        {ppStatus && (
-          <p className={`config-debug ${ppStatus.ok ? "ok" : "ko"}`}>
-            {ppStatus.ok ? "OK" : "KO"} - {ppStatus.message}
-          </p>
-        )}
-        {ppMessages.length > 0 && (
-          <div className="config-debug-list">
-            <div className="config-debug-title">Messages disponibles</div>
-            {ppMessages.map((m) => (
-              <div key={m.id} className="message-pick-row">
-                <div className="message-pick-main">
-                  <span className="message-pick-name">{m.name || "Sans nom"}</span>
-                  {m.tokenNames?.length > 0 && (
-                    <span className="message-pick-tokens">
-                      jetons : {m.tokenNames.join(", ")}
-                      {m.theme ? ` · thème ${m.theme}` : ""}
-                    </span>
-                  )}
-                  {config.dualMessages &&
-                    m.name === config.messageName &&
-                    m.tokenNames?.includes(config.refTokenName) && (
-                      <span className="message-pick-warn">
-                        Retire le jeton {config.refTokenName} de ce message en
-                        mode dual.
-                      </span>
-                    )}
-                </div>
-                <code className="message-pick-id">{m.id}</code>
-                {config.dualMessages ? (
-                  <div className="message-pick-actions">
-                    <button
-                      type="button"
-                      className="message-pick-btn"
-                      onClick={() =>
-                        setConfig({
-                          ...config,
-                          refMessageId: m.id,
-                          refMessageName: m.name || config.refMessageName,
-                        })
-                      }
-                    >
-                      → Réf.
-                    </button>
-                    <button
-                      type="button"
-                      className="message-pick-btn"
-                      onClick={() =>
-                        setConfig({
-                          ...config,
-                          messageId: m.id,
-                          messageName: m.name || config.messageName,
-                        })
-                      }
-                    >
-                      → Verset
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    className="message-pick-btn message-pick-btn-solo"
-                    onClick={() =>
-                      setConfig({
-                        ...config,
-                        messageId: m.id,
-                        messageName: m.name || config.messageName,
-                      })
-                    }
-                  >
-                    Utiliser
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-        <p className="config-help">
-          {config.dualMessages ? (
-            <>
-              Mode <strong>deux messages</strong> : message{" "}
-              <strong>{config.refMessageName}</strong> avec uniquement le jeton{" "}
-              {config.refTokenName} (thème petit, ex. Scripture) et message{" "}
-              <strong>{config.messageName}</strong> avec <em>uniquement</em> le
-              jeton {config.textTokenName} (thème grand). Ne mets pas{" "}
-              {config.refTokenName} dans le message verset si tu veux les
-              séparer visuellement.
-            </>
-          ) : (
-            <>
-              Message unique <strong>{config.messageName}</strong> avec jetons{" "}
-              {config.refTokenName} et {config.textTokenName}.
-            </>
-          )}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function Field({ label, value, onChange, placeholder, mono, full }) {
-  return (
-    <label className={`field ${full ? "field-full" : ""}`}>
-      <span className="field-label">{label}</span>
-      <input
-        className={`field-input ${mono ? "mono" : ""}`}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-      />
-    </label>
-  );
-}

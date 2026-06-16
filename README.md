@@ -462,6 +462,31 @@ Voir `services/license-proxy/README.md` pour le déploiement VPS, quotas et dés
 
 Voir `delivery/docs/CHECKLIST-LIVRAISON.md` pour la checklist complète.
 
+## Architecture backend (refactor en cours)
+
+```
+backend/
+├── config/env.js          # chargement + validation .env
+├── routes/                # routes Express (ProPresenter…)
+├── services/
+│   ├── searchService.js   # recherche offline (testée)
+│   └── propresenterService.js
+├── utils/text.js          # normalize, parseReferenceString
+└── server.js              # point d'entrée (STT encore ici)
+```
+
+Tests : `npm test` (backend + frontend) · CI : `.github/workflows/ci.yml`
+
+## UX régie
+
+| Fonction | Détail |
+|---------|--------|
+| **Mode démo** | Bouton « Démo » — simule l'écran ProPresenter |
+| **Mode Live** | Interface agrandie · raccourci `⌘L` |
+| **Raccourcis 1-2-3** | Envoie les 3 premiers résultats |
+| **Historique** | Envois avec nom de culte + renvoi |
+| **Confirmation** | Toast vert après envoi |
+
 ## Garde-fou
 
 Aucun envoi vers ProPresenter ne se déclenche automatiquement. Le bouton **"Afficher dans ProPresenter"** est le seul déclencheur.

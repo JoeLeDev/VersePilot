@@ -37,6 +37,33 @@ const DEEPGRAM_BIBLE_KEYTERMS = [
   "chapitre", "verset",
 ];
 
+/** @type {Map<string, { count: number, resetAt: number }>} */
+const rateLimitByKey = new Map();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = Number(process.env.RATE_LIMIT_PER_MIN || 120);
+
+function checkRateLimit(licenseKey) {
+  const now = Date.now();
+  const entry = rateLimitByKey.get(licenseKey) || {
+    count: 0,
+    resetAt: now + RATE_LIMIT_WINDOW_MS,
+  };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + RATE_LIMIT_WINDOW_MS;
+  }
+  entry.count += 1;
+  rateLimitByKey.set(licenseKey, entry);
+  if (entry.count > RATE_LIMIT_MAX_REQUESTS) {
+    return {
+      ok: false,
+      status: 429,
+      error: "Trop de requêtes — réessayez dans une minute.",
+    };
+  }
+  return { ok: true };
+}
+
 /** @type {Map<string, { minutes: number, month: string }>} */
 const usageByKey = new Map();
 
@@ -158,6 +185,10 @@ app.get("/health", (_req, res) => {
 
 app.get("/v1/license/status", (req, res) => {
   const licenseKey = getLicenseKey(req);
+  const rate = checkRateLimit(licenseKey || req.ip || "anon");
+  if (!rate.ok) {
+    return res.status(rate.status).json({ error: rate.error });
+  }
   const check = validateLicense(licenseKey);
   if (!check.ok) {
     return res.status(check.status).json({ ok: false, error: check.error });
@@ -178,6 +209,10 @@ app.post("/v1/transcribe", async (req, res) => {
     return res.status(503).json({ error: "Deepgram non configuré sur le proxy." });
   }
   const licenseKey = getLicenseKey(req);
+  const rate = checkRateLimit(licenseKey || req.ip || "anon");
+  if (!rate.ok) {
+    return res.status(rate.status).json({ error: rate.error });
+  }
   const check = validateLicense(licenseKey);
   if (!check.ok) {
     return res.status(check.status).json({ error: check.error });
@@ -224,6 +259,10 @@ wss.on("connection", (client, req) => {
   }
 
   const licenseKey = getLicenseKey(req);
+  const rate = checkRateLimit(licenseKey || req.ip || "anon");
+  if (!rate.ok) {
+    return res.status(rate.status).json({ error: rate.error });
+  }
   const check = validateLicense(licenseKey);
   if (!check.ok) {
     client.send(JSON.stringify({ type: "error", error: check.error }));

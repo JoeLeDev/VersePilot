@@ -6,12 +6,8 @@ import cors from "cors";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
-import os from "os";
 import { fileURLToPath } from "url";
-import { promisify } from "util";
-import { execFile } from "child_process";
 import http from "http";
-import { WebSocketServer, WebSocket } from "ws";
 import OpenAI from "openai";
 import {
   verseKey,
@@ -30,6 +26,12 @@ import {
   isDeepgramAvailable,
   proxyWsUrl,
 } from "./lib/versepilot-license.js";
+import { searchOffline as searchOfflineCore } from "./services/searchService.js";
+import { parseReferenceString } from "./utils/text.js";
+import { safeError } from "./utils/safeLog.js";
+import { createProPresenterRouter } from "./routes/propresenterRoutes.js";
+import { createSttService } from "./services/sttService.js";
+import { createSttRouter } from "./routes/sttRoutes.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -265,6 +267,7 @@ function loadBible(slug = DEFAULT_BIBLE_SLUG) {
     activeBibleSlug = slug;
     rebuildSearchIndex();
     WHISPER_CPP_PROMPT = buildWhisperCppPrompt();
+    sttService.onBibleUpdated();
     embeddingIndex = null;
     const semanticReady =
       SEMANTIC_SEARCH !== "off" &&
@@ -305,6 +308,7 @@ function loadBible(slug = DEFAULT_BIBLE_SLUG) {
     activeBibleSlug = "sample";
     rebuildSearchIndex();
     WHISPER_CPP_PROMPT = buildWhisperCppPrompt();
+    sttService.onBibleUpdated();
     console.warn(
       `⚠️  ${slug}.json introuvable. Fallback verset sample (${VERSES.length}). Exécute: npm run import-bibles`
     );
@@ -323,7 +327,7 @@ console.log(
   `🎙️ STT mode: ${STT_MODE} (deepgram: ${DEEPGRAM_MODEL}/${DEEPGRAM_LANGUAGE}, mlx: ${MLX_STT_URL})`
 );
 if (STT_MODE === "mlx" || STT_MODE === "hybrid") {
-  probeMlxStt().then((p) => {
+  sttService.probeMlxStt().then((p) => {
     if (!p.ok) {
       console.warn(
         `⚠️ Serveur MLX STT non joignable (${MLX_STT_URL}). Lance: npm run mlx-stt --prefix backend`
@@ -367,6 +371,17 @@ const openai = process.env.OPENAI_API_KEY
   apiKey: process.env.OPENAI_API_KEY,
     })
   : null;
+
+const sttService = createSttService({
+  normalize,
+  escapeRegex,
+  applyBiblicalLexicon,
+  getBibleBooks: () => BIBLE_BOOKS,
+  licenseConfig: LICENSE_CONFIG,
+  isDeepgramAvailable,
+  proxyWsUrl,
+  openai,
+});
 
 // --- Helpers ---
 const DEFAULT_PP_PORT = 50001;
@@ -558,18 +573,6 @@ function getBibleContext(slug, book, chapter, centerVerse, radius = 3) {
   };
 }
 
-function parseReferenceString(ref) {
-  const m = String(ref || "")
-    .trim()
-    .match(/^(.+?)\s+(\d+)\s*:\s*(\d+)\s*$/);
-  if (!m) return null;
-  return {
-    book: m[1].trim(),
-    chapter: parseInt(m[2], 10),
-    verse: parseInt(m[3], 10),
-  };
-}
-
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -689,34 +692,10 @@ function scoreVerseLocal(query, verse) {
 }
 
 function searchOffline(query, max = 3) {
-  const q = normalize(query);
-  const refMatch = q.match(/([1-3]?\s?[a-z]+)\s+(\d+)(?:\s*[:.]\s*(\d+))?/);
-  const candidates = refMatch ? getCandidatePool(query) : VERSES;
-
-  const ranked = candidates
-    .map((v) => {
-      const scored = scoreVerseLocal(query, v);
-      return {
-        ...v,
-        score: scored.score,
-        tokenHits: scored.tokenHits,
-        reason: scored.reason,
-      };
-    })
-    .filter((v) => v.score > 0)
-    .sort((a, b) => b.tokenHits - a.tokenHits || b.score - a.score);
-
-  const boosted = applyChapterBonuses(query, ranked);
-
-  return boosted.slice(0, max).map((v) =>
-    suggestionFromVerse(v, {
-      reason: v.reason,
-      score: v.score,
-      tokenHits: v.tokenHits,
-      source: v.score >= 90 ? "reference" : "lexical",
-    })
-  );
+  return searchOfflineCore(query, VERSES, versesByBookNorm, max);
 }
+
+// parseReferenceString → utils/text.js
 
 /** Clé de tri : d'abord mots en commun, puis score lexical ; sémantique en appoint. */
 function lexicalSortKey(item) {
@@ -1049,394 +1028,8 @@ async function triggerProPresenterMessage(baseUrl, messageId, tokens) {
   return { url, response: bodyText };
 }
 
-function decodeBase64Audio(audioBase64) {
-  if (!audioBase64 || typeof audioBase64 !== "string") return null;
-  const b64 = audioBase64.includes(",") ? audioBase64.split(",")[1] : audioBase64;
-  return Buffer.from(b64, "base64");
-}
-
-/** Contexte du segment précédent (comme Pewbeam) pour limiter les hallucinations MLX. */
-let mlxPreviousText = "";
-
-function parseWavToMonoPcm16(wavBuffer, targetRate = 16000) {
-  if (!wavBuffer || wavBuffer.length < 44) {
-    throw new Error("Fichier WAV invalide ou trop court.");
-  }
-  if (wavBuffer.toString("ascii", 0, 4) !== "RIFF") {
-    throw new Error("Format audio non WAV.");
-  }
-
-  let fmtOffset = -1;
-  let dataOffset = -1;
-  let dataSize = 0;
-  let offset = 12;
-
-  while (offset + 8 <= wavBuffer.length) {
-    const chunkId = wavBuffer.toString("ascii", offset, offset + 4);
-    const chunkSize = wavBuffer.readUInt32LE(offset + 4);
-    offset += 8;
-    if (chunkId === "fmt ") fmtOffset = offset;
-    if (chunkId === "data") {
-      dataOffset = offset;
-      dataSize = chunkSize;
-      break;
-    }
-    offset += chunkSize + (chunkSize % 2);
-  }
-
-  if (fmtOffset < 0 || dataOffset < 0) {
-    throw new Error("Chunks WAV fmt/data introuvables.");
-  }
-
-  const audioFormat = wavBuffer.readUInt16LE(fmtOffset);
-  const channels = wavBuffer.readUInt16LE(fmtOffset + 2);
-  const sampleRate = wavBuffer.readUInt32LE(fmtOffset + 4);
-  const bitsPerSample = wavBuffer.readUInt16LE(fmtOffset + 14);
-
-  if (audioFormat !== 1 || bitsPerSample !== 16) {
-    throw new Error("Seul le PCM 16-bit est supporté pour MLX STT.");
-  }
-
-  const frameCount = Math.floor(dataSize / (channels * 2));
-  const mono = Buffer.alloc(frameCount * 2);
-
-  for (let i = 0; i < frameCount; i += 1) {
-    const base = dataOffset + i * channels * 2;
-    if (channels === 1) {
-      mono[i * 2] = wavBuffer[base];
-      mono[i * 2 + 1] = wavBuffer[base + 1];
-    } else {
-      let sum = 0;
-      for (let ch = 0; ch < channels; ch += 1) {
-        sum += wavBuffer.readInt16LE(base + ch * 2);
-      }
-      const avg = Math.round(sum / channels);
-      mono.writeInt16LE(avg, i * 2);
-    }
-  }
-
-  if (sampleRate === targetRate) return mono;
-
-  const outFrames = Math.max(1, Math.floor((frameCount * targetRate) / sampleRate));
-  const resampled = Buffer.alloc(outFrames * 2);
-  for (let i = 0; i < outFrames; i += 1) {
-    const srcPos = (i * sampleRate) / targetRate;
-    const idx = Math.min(frameCount - 1, Math.floor(srcPos));
-    const next = Math.min(frameCount - 1, idx + 1);
-    const frac = srcPos - idx;
-    const s0 = mono.readInt16LE(idx * 2);
-    const s1 = mono.readInt16LE(next * 2);
-    resampled.writeInt16LE(Math.round(s0 + (s1 - s0) * frac), i * 2);
-  }
-  return resampled;
-}
-
-async function probeMlxStt() {
-  try {
-    const r = await fetch(`${MLX_STT_URL}/health`, {
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!r.ok) return { ok: false, detail: `HTTP ${r.status}` };
-    const data = await r.json();
-    return {
-      ok: true,
-      modelLoaded: Boolean(data.model_loaded),
-      avgInferenceMs: data.avg_inference_ms ?? null,
-    };
-  } catch (err) {
-    return { ok: false, detail: err.message || "indisponible" };
-  }
-}
-
-async function transcribeWithMlx(wavBuffer) {
-  const pcm16 = parseWavToMonoPcm16(wavBuffer, 16000);
-  const useBiblicalHints =
-    (process.env.MLX_STT_BIBLICAL_HINTS || "false").toLowerCase() === "true";
-  const payload = {
-    audio_b64: pcm16.toString("base64"),
-    sample_rate: 16000,
-    language: MLX_STT_LANG,
-    use_biblical_hints: useBiblicalHints,
-    previous_text:
-      mlxPreviousText && !isSttRepetitiveHallucination(mlxPreviousText)
-        ? mlxPreviousText
-        : undefined,
-  };
-
-  const r = await fetch(`${MLX_STT_URL}/transcribe`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(90000),
-  });
-
-  const raw = await r.text();
-  let data = null;
-  try {
-    data = raw ? JSON.parse(raw) : null;
-  } catch {
-    data = null;
-  }
-
-  if (!r.ok) {
-    throw new Error(
-      (data && data.detail) ||
-        (data && data.error) ||
-        `MLX STT HTTP ${r.status}`
-    );
-  }
-
-  let text = String(data?.text || "").trim();
-  if (isSttRepetitiveHallucination(text)) {
-    mlxPreviousText = "";
-    return "";
-  }
-  if (text) {
-    mlxPreviousText = `${mlxPreviousText} ${text}`.trim().slice(-400);
-  }
-  return text;
-}
-
-function whisperErrorText(err) {
-  return `${err?.message || ""} ${err?.stderr || ""} ${err?.stdout || ""}`;
-}
-
-function isWhisperMetalCrash(err) {
-  const msg = whisperErrorText(err);
-  return msg.includes("GGML_ASSERT") || msg.includes("ggml-metal-device");
-}
-
-function isWhisperProcessFailure(err) {
-  return whisperErrorText(err).includes("failed to process audio");
-}
-
-function buildWhisperArgs(inputPath, outBase, { useGpu }) {
-  const args = [
-    "-m",
-    WHISPER_MODEL_PATH,
-    "-f",
-    inputPath,
-    "-l",
-    WHISPER_LANG,
-    "-t",
-    String(WHISPER_THREADS),
-      "-bs",
-      String(WHISPER_BEAM_SIZE),
-    "--prompt",
-    WHISPER_CPP_PROMPT,
-    "-otxt",
-    "-of",
-    outBase,
-    "-np",
-  ];
-
-  if (!useGpu) {
-    args.push("-ng", "-nfa");
-  }
-  if (WHISPER_SUPPRESS_NST) args.push("-sns");
-  if (WHISPER_CARRY_PROMPT) args.push("--carry-initial-prompt");
-  if (WHISPER_USE_VAD) args.push("--vad");
-
-  return args;
-}
-
-async function transcribeWithWhisperCpp(audioBuffer) {
-  if (WHISPER_MODE !== "local") {
-    throw new Error("WHISPER_MODE doit etre 'local' pour la transcription offline.");
-  }
-
-  if (!fs.existsSync(WHISPER_MODEL_PATH)) {
-    throw new Error(
-      `Modele whisper introuvable: ${WHISPER_MODEL_PATH}. Configure WHISPER_MODEL_PATH.`
-    );
-  }
-
-  const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "versepilot-"));
-  const inputPath = path.join(tempRoot, "input.wav");
-  const outBase = path.join(tempRoot, "output");
-  const outTxt = `${outBase}.txt`;
-
-  try {
-    await fs.promises.writeFile(inputPath, audioBuffer);
-
-    const useGpu = !WHISPER_NO_GPU;
-    let whisperArgs = buildWhisperArgs(inputPath, outBase, { useGpu });
-
-    const run = async (args) =>
-      execFileAsync(WHISPER_BIN, args, {
-        timeout: 45000,
-        maxBuffer: 10 * 1024 * 1024,
-      });
-
-    try {
-      await run(whisperArgs);
-    } catch (err) {
-      if (useGpu && isWhisperMetalCrash(err)) {
-        console.warn("⚠️ Crash Metal Whisper detecte, retry en mode CPU (-ng).");
-        whisperArgs = buildWhisperArgs(inputPath, outBase, { useGpu: false });
-        await run(whisperArgs);
-      } else if (WHISPER_USE_VAD && isWhisperProcessFailure(err)) {
-        console.warn("⚠️ Whisper --vad en echec, retry sans VAD.");
-        whisperArgs = buildWhisperArgs(inputPath, outBase, { useGpu: !WHISPER_NO_GPU }).filter(
-          (a) => a !== "--vad"
-        );
-        await run(whisperArgs);
-      } else {
-        throw err;
-      }
-    }
-
-    const text = (await fs.promises.readFile(outTxt, "utf-8")).trim();
-    return text;
-  } catch (err) {
-    if (err?.code === "ENOENT") {
-      throw new Error(
-        `Binaire whisper introuvable (${WHISPER_BIN}). Installe whisper.cpp et configure WHISPER_BIN.`
-      );
-    }
-    if (isWhisperMetalCrash(err) && !WHISPER_NO_GPU) {
-      throw new Error(
-        "Whisper a plante (GPU Metal). Mets WHISPER_NO_GPU=true dans backend/.env puis redemarre."
-      );
-    }
-    if (isWhisperProcessFailure(err)) {
-      throw new Error(
-        "Whisper n'a pas pu traiter l'audio. Verifie le micro, puis reessaie (chunk plus court ou modele small)."
-      );
-    }
-    throw new Error(err.message || "Transcription offline impossible.");
-  } finally {
-    await fs.promises.rm(tempRoot, { recursive: true, force: true });
-  }
-}
-
-/** Boucles Whisper/MLX (ex. « produseur du délau » répété sur silence). */
-function isSttRepetitiveHallucination(text) {
-  if (!text || typeof text !== "string") return false;
-  const tokens = text
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .split(/\s+/)
-    .filter(Boolean);
-  const n = tokens.length;
-  if (n >= 8 && new Set(tokens.slice(-8)).size === 1) return true;
-  if (n >= 12 && new Set(tokens).size / n < 0.2) return true;
-
-  let prev = null;
-  let runLen = 0;
-  for (const token of tokens) {
-    if (token === prev) {
-      runLen += 1;
-      if (runLen >= 6) return true;
-    } else {
-      prev = token;
-      runLen = 1;
-    }
-  }
-  return false;
-}
-
-function isSttPromptEcho(text) {
-  const n = normalize(text);
-  if (!n) return true;
-  for (const phrase of STT_PROMPT_ECHO_PHRASES) {
-    const p = normalize(phrase);
-    if (!p) continue;
-    if (n === p) return true;
-    if (n.includes(p) && n.length <= p.length + 12) return true;
-  }
-  const stripped = stripSttPromptHallucination(text, { skipEchoCheck: true });
-  return !stripped;
-}
-
-/** Retire l'écho du prompt STT (liste de livres, phrases Louis Segond, etc.). */
-function stripSttPromptHallucination(text, opts = {}) {
-  let out = String(text || "").trim();
-  if (!out) return out;
-
-  for (const phrase of STT_PROMPT_ECHO_PHRASES) {
-    const escaped = escapeRegex(phrase);
-    out = out.replace(new RegExp(escaped, "gi"), " ");
-  }
-  if (OPENAI_TRANSCRIBE_PROMPT) {
-    out = out.replace(new RegExp(escapeRegex(OPENAI_TRANSCRIBE_PROMPT), "gi"), " ");
-  }
-
-  out = out.replace(
-    /Bible française Louis Segond,?\s*versets bibliques,?\s*référence livre chapitre verset\.?\s*/gi,
-    " "
-  );
-  out = out.replace(
-    /\bPrédication en français\.?\s*(Lecture biblique Louis Segond\.?\s*)?/gi,
-    " "
-  );
-  out = out.replace(/\bLecture biblique Louis Segond\.?\s*/gi, " ");
-  out = out.replace(/\bversets bibliques\b/gi, " ");
-  out = out.replace(/\bréférence livre chapitre verset\b/gi, " ");
-
-  if (BIBLE_BOOKS.length) {
-    const names = [...BIBLE_BOOKS]
-      .sort((a, b) => b.length - a.length)
-      .map(escapeRegex);
-    const bookRunRe = new RegExp(`(?:\\b(?:${names.join("|")})\\b\\s*){3,}`, "gi");
-    out = out.replace(bookRunRe, " ");
-  }
-
-  const parts = out
-    .split(/\s{2,}|(?<=[.!?])\s+/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-  if (parts.length > 1) {
-    const bookNorms = new Set(BIBLE_BOOKS.map((b) => normalize(b)));
-    const kept = parts.filter((chunk) => {
-      const words = chunk.split(/\s+/).filter((w) => w.length > 1);
-      if (words.length < 4) return true;
-      let bookHits = 0;
-      for (const w of words) {
-        const nw = normalize(w);
-        if ([...bookNorms].some((b) => b === nw || b.includes(nw) || nw.includes(b))) {
-          bookHits += 1;
-        }
-      }
-      return bookHits / words.length < 0.55;
-    });
-    if (kept.length) out = kept.join(" ");
-  }
-
-  out = out.replace(/\s+/g, " ").trim();
-  if (!opts.skipEchoCheck && !out) return "";
-  return out;
-}
-
-function cleanupTranscribedText(text) {
-  if (isSttKnownHallucination(text)) return "";
-  if (isSttRepetitiveHallucination(text)) return "";
-  if (isSttPromptEcho(text)) return "";
-  let out = stripSttPromptHallucination(text);
-  if (!out || isSttPromptEcho(out) || isSttRepetitiveHallucination(out)) return "";
-
-  // Ignore common non-speech tags and noise markers from transcription models.
-  out = out.replace(/\[[^\]]+\]/g, " ");
-  out = out.replace(/\*[^*]+\*/g, " ");
-
-  // Remove common filler words in FR speech.
-  out = out.replace(/\b(euh|hum|hein|bah|ben)\b/gi, " ");
-
-  for (const [pattern, value] of BOOK_ALIASES) {
-    out = out.replace(pattern, value);
-  }
-
-  out = applyBiblicalLexicon(out);
-
-  out = out.replace(/\s+/g, " ").trim();
-  return out;
-}
-
 function correctBiblicalSpeech(text) {
-  const base = String(text || "").trim();
-  if (!base) return base;
-  return applyBiblicalLexicon(base).replace(/\s+/g, " ").trim();
+  return sttService.correctBiblicalSpeech(text);
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,448 +1278,8 @@ app.post("/search-verse", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// POST /send-to-propresenter
-// Body: {
-//   ip: string, port: number,
-//   dualMessages?: boolean,      // deux messages PP distincts (réf. puis verset)
-//   messageName?: string,        // message verset (défaut: "Verset")
-//   messageId?: string,
-//   refMessageName?: string,     // message référence (défaut: "Reference")
-//   refMessageId?: string,
-//   refTokenName?: string,       // default: "Reference"
-//   textTokenName?: string,      // default: "Verset"
-//   reference: string,
-//   text: string
-// }
-// Forwards the verse to ProPresenter's HTTP API (Messages > Trigger).
-// ---------------------------------------------------------------------------
-app.post("/send-to-propresenter", async (req, res) => {
-  try {
-    const {
-      ip,
-      port,
-      dualMessages = false,
-      messageName = "Verset",
-      messageId,
-      refMessageName = "Reference",
-      refMessageId,
-      refTokenName = "Reference",
-      textTokenName = "Verset",
-      reference,
-      text,
-    } = req.body;
-
-    if (!ip || !port || !reference || !text) {
-      return res
-        .status(400)
-        .json({ error: "Champs requis : ip, port, reference, text." });
-    }
-
-    const baseUrl = buildProPresenterBaseUrl(ip, port);
-
-    if (dualMessages) {
-      const dualMessageOrder = String(
-        req.body.dualMessageOrder || "verse-first"
-      ).toLowerCase();
-      const dualDelayMs = Math.min(
-        800,
-        Math.max(0, Number(req.body.dualDelayMs) || 220)
-      );
-
-      let refMsg;
-      let verseMsg;
-      let allMessages;
-      try {
-        allMessages = await fetchMessages(baseUrl);
-        refMsg = await resolveMessageByName(
-          baseUrl,
-          refMessageName,
-          refMessageId
-        );
-        verseMsg = await resolveMessageByName(baseUrl, messageName, messageId);
-      } catch (err) {
-        if (err.availableMessages) {
-          return res.status(404).json({
-            error: err.message,
-            availableMessages: err.availableMessages,
-          });
-        }
-        throw err;
-      }
-
-      const verseRaw =
-        allMessages.find((m) => m.id === verseMsg.id)?.raw || null;
-      const refRaw = allMessages.find((m) => m.id === refMsg.id)?.raw || null;
-
-      const refTokens = [{ name: refTokenName, text: { text: reference } }];
-      const verseTokens = [{ name: textTokenName, text: { text } }];
-
-      // Le message « Verset » ne doit pas ré-afficher la référence en mode dual.
-      if (messageIncludesToken(verseRaw, refTokenName)) {
-        verseTokens.push({ name: refTokenName, text: { text: "" } });
-      }
-      if (messageIncludesToken(refRaw, textTokenName)) {
-        refTokens.push({ name: textTokenName, text: { text: "" } });
-      }
-
-      const triggerRef = () =>
-        triggerProPresenterMessage(baseUrl, refMsg.id, refTokens);
-      const triggerVerse = () =>
-        triggerProPresenterMessage(baseUrl, verseMsg.id, verseTokens);
-
-      let refTrigger;
-      let verseTrigger;
-      if (dualMessageOrder === "reference-first") {
-        refTrigger = await triggerRef();
-        if (dualDelayMs) await sleep(dualDelayMs);
-        verseTrigger = await triggerVerse();
-      } else {
-        verseTrigger = await triggerVerse();
-        if (dualDelayMs) await sleep(dualDelayMs);
-        refTrigger = await triggerRef();
-      }
-
-      const setupHints = [];
-      if (messageIncludesToken(verseRaw, refTokenName)) {
-        setupHints.push(
-          `Le message « ${verseMsg.name} » contient aussi le jeton {${refTokenName}} : retire-le du modèle ProPresenter pour un affichage séparé propre.`
-        );
-      }
-
-      return res.json({
-        ok: true,
-        mode: "dual",
-        dualMessageOrder,
-        setupHints: setupHints.length ? setupHints : undefined,
-        triggers: [
-          {
-            role: "reference",
-            messageName: refMsg.name,
-            messageId: refMsg.id,
-            ...refTrigger,
-          },
-          {
-            role: "verse",
-            messageName: verseMsg.name,
-            messageId: verseMsg.id,
-            ...verseTrigger,
-          },
-        ],
-      });
-    }
-
-    const verseMsg = await resolveMessageByName(baseUrl, messageName, messageId);
-    const single = await triggerProPresenterMessage(baseUrl, verseMsg.id, [
-      { name: refTokenName, text: { text: reference } },
-      { name: textTokenName, text: { text } },
-    ]);
-
-    return res.json({
-      ok: true,
-      mode: "single",
-      url: single.url,
-      messageId: verseMsg.id,
-      messageName: verseMsg.name,
-      response: single.response,
-    });
-  } catch (err) {
-    console.error("send-to-propresenter error:", err);
-    if (err.url) {
-      return res.status(502).json({
-        error: err.message,
-        details: err.details,
-        url: err.url,
-      });
-    }
-    return res
-      .status(500)
-      .json({ error: err.message || "Connexion ProPresenter impossible." });
-  }
-});
-
-async function transcribeWithDeepgram(audioBuffer) {
-  if (LICENSE_CONFIG.enabled) {
-    const r = await fetch(`${LICENSE_CONFIG.proxyUrl}/v1/transcribe`, {
-      method: "POST",
-      headers: {
-        "X-VersePilot-License": LICENSE_CONFIG.licenseKey,
-        "Content-Type": "audio/wav",
-      },
-      body: audioBuffer,
-      signal: AbortSignal.timeout(25000),
-    });
-    const data = await r.json().catch(() => null);
-    if (!r.ok) {
-      throw new Error(data?.error || `Proxy licence HTTP ${r.status}`);
-    }
-    return String(data?.transcript || "").trim();
-  }
-
-  if (!DEEPGRAM_API_KEY) {
-    throw new Error(
-      "DEEPGRAM_API_KEY manquant. Configure DEEPGRAM_API_KEY ou VERSEPILOT_LICENSE_KEY + VERSEPILOT_PROXY_URL."
-    );
-  }
-
-  const params = new URLSearchParams({
-    model: DEEPGRAM_MODEL,
-    language: DEEPGRAM_LANGUAGE,
-    punctuate: "true",
-    smart_format: "true",
-    diarize: "false",
-  });
-  if (DEEPGRAM_KEYWORDS_ENABLED) {
-    for (const term of DEEPGRAM_BIBLE_KEYTERMS) {
-      params.append("keywords", `${term}:2`);
-    }
-  }
-
-  const r = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
-      method: "POST",
-    headers: {
-      Authorization: `Token ${DEEPGRAM_API_KEY}`,
-      "Content-Type": "audio/wav",
-    },
-    body: audioBuffer,
-    signal: AbortSignal.timeout(20000),
-  });
-
-  const raw = await r.text();
-  let data = null;
-  try {
-    data = raw ? JSON.parse(raw) : null;
-  } catch {
-    data = null;
-  }
-
-  if (!r.ok) {
-    const msg =
-      data?.err_msg ||
-      data?.error ||
-      data?.message ||
-      `Deepgram HTTP ${r.status}`;
-    throw new Error(msg);
-  }
-
-  const transcript =
-    data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
-  return String(transcript).trim();
-}
-
-async function transcribeWithOpenAI(audioBuffer) {
-  if (!openai) {
-    throw new Error("OPENAI_API_KEY manquant pour la transcription cloud.");
-  }
-
-  const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "versepilot-openai-"));
-  const inputPath = path.join(tempRoot, "chunk.wav");
-
-  try {
-    await fs.promises.writeFile(inputPath, audioBuffer);
-    const request = {
-      file: fs.createReadStream(inputPath),
-      model: OPENAI_TRANSCRIBE_MODEL,
-      language: WHISPER_LANG,
-    };
-    if (OPENAI_TRANSCRIBE_USE_PROMPT && OPENAI_TRANSCRIBE_PROMPT) {
-      request.prompt = OPENAI_TRANSCRIBE_PROMPT;
-    }
-    const result = await openai.audio.transcriptions.create(request);
-
-    return String(result.text || "").trim();
-  } finally {
-    await fs.promises.rm(tempRoot, { recursive: true, force: true });
-  }
-}
-
-async function transcribeAudio(audioBuffer, mode = STT_MODE) {
-  if (mode === "deepgram") {
-    return {
-      text: await transcribeWithDeepgram(audioBuffer),
-      engine: "deepgram",
-    };
-  }
-
-  if (mode === "mlx") {
-    return {
-      text: await transcribeWithMlx(audioBuffer),
-      engine: "mlx",
-    };
-  }
-
-  if (mode === "openai") {
-    return {
-      text: await transcribeWithOpenAI(audioBuffer),
-      engine: "openai",
-    };
-  }
-
-  if (mode === "hybrid") {
-    if (isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG)) {
-      try {
-        return {
-          text: await transcribeWithDeepgram(audioBuffer),
-          engine: "deepgram",
-        };
-      } catch (dgErr) {
-        console.warn("STT hybrid: Deepgram ->", dgErr.message);
-      }
-    }
-    try {
-      return {
-        text: await transcribeWithMlx(audioBuffer),
-        engine: "mlx",
-      };
-    } catch (mlxErr) {
-      console.warn("STT hybrid: MLX ->", mlxErr.message);
-    }
-    try {
-      return {
-        text: await transcribeWithOpenAI(audioBuffer),
-        engine: "openai",
-      };
-    } catch (err) {
-      console.warn("STT hybrid: OpenAI -> whisper.cpp :", err.message);
-      return {
-        text: await transcribeWithWhisperCpp(audioBuffer),
-        engine: "local",
-      };
-    }
-  }
-
-  return {
-    text: await transcribeWithWhisperCpp(audioBuffer),
-    engine: "local",
-  };
-}
-
-async function handleTranscribeRequest(req, res, forcedMode) {
-  try {
-    const { audioBase64 } = req.body;
-    const audioBuffer = decodeBase64Audio(audioBase64);
-    if (!audioBuffer || audioBuffer.length === 0) {
-      return res.status(400).json({ error: "audioBase64 requis." });
-    }
-
-    const mode = String(forcedMode || STT_MODE).toLowerCase();
-    const { text, engine } = await transcribeAudio(audioBuffer, mode);
-    const cleanedText = cleanupTranscribedText(text);
-
-    return res.json({
-      ok: true,
-      text: cleanedText,
-      rawText: text,
-      engine,
-      mode,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Transcription impossible.",
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// POST /transcribe
-// Body: { audioBase64: string }
-// Uses STT_MODE: deepgram | mlx | openai | local | hybrid
-// ---------------------------------------------------------------------------
-app.post("/transcribe", (req, res) => handleTranscribeRequest(req, res));
-
-app.post("/stt/warmup", async (_req, res) => {
-  try {
-    const r = await fetch(`${MLX_STT_URL}/warmup`, {
-      method: "POST",
-      signal: AbortSignal.timeout(120000),
-    });
-    const data = await r.json().catch(() => ({}));
-    return res.status(r.status).json(data);
-  } catch (err) {
-    return res.status(503).json({
-      error: err.message || "Serveur MLX STT indisponible. Lance npm run mlx-stt.",
-    });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// POST /transcribe-offline
-// Body: { audioBase64: string } where audio is a WAV payload
-// Always local whisper.cpp
-// ---------------------------------------------------------------------------
-app.post("/transcribe-offline", (req, res) =>
-  handleTranscribeRequest(req, res, "local")
-);
-
-// ---------------------------------------------------------------------------
-// GET /propresenter/health
-// Query: ?ip=127.0.0.1&port=50001
-// Checks basic connectivity and version endpoint.
-// ---------------------------------------------------------------------------
-app.get("/propresenter/health", async (req, res) => {
-  try {
-    const ip = String(req.query.ip || "").trim();
-    const port = Number(req.query.port) || DEFAULT_PP_PORT;
-    if (!ip) {
-      return res.status(400).json({ error: "Paramètre 'ip' requis." });
-    }
-
-    const baseUrl = buildProPresenterBaseUrl(ip, port);
-    const response = await fetch(`${baseUrl}/version`);
-    const { bodyText, bodyJson } = await readResponseBody(response);
-
-    if (!response.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: `ProPresenter a répondu ${response.status}`,
-        details: bodyText,
-        baseUrl,
-      });
-    }
-
-    return res.json({
-      ok: true,
-      baseUrl,
-      version: bodyJson || bodyText || null,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Connexion ProPresenter impossible.",
-    });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// GET /propresenter/messages
-// Query: ?ip=127.0.0.1&port=50001
-// Returns available messages for UI debug/selection.
-// ---------------------------------------------------------------------------
-app.get("/propresenter/messages", async (req, res) => {
-  try {
-    const ip = String(req.query.ip || "").trim();
-    const port = Number(req.query.port) || DEFAULT_PP_PORT;
-    if (!ip) {
-      return res.status(400).json({ error: "Paramètre 'ip' requis." });
-    }
-
-    const baseUrl = buildProPresenterBaseUrl(ip, port);
-    const messages = await fetchMessages(baseUrl);
-
-    return res.json({
-      ok: true,
-      baseUrl,
-      count: messages.length,
-      messages: messages.map((m) => summarizeMessage(m)),
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Récupération des messages impossible.",
-    });
-  }
-});
+app.use(createProPresenterRouter({ defaultPort: DEFAULT_PP_PORT }));
+app.use(createSttRouter(sttService));
 
 // ---------------------------------------------------------------------------
 // POST /propresenter/clear
@@ -2199,51 +1352,53 @@ app.post("/propresenter/clear", async (req, res) => {
 
 // Health check
 app.get("/health", async (req, res) => {
-  const mlxProbe = await probeMlxStt();
-  res.json({
-    ok: true,
-    verses: VERSES.length,
-    bibleVersion: activeBibleSlug,
-    bibleName: BIBLE_META.name,
-    bibleVersionsAvailable: listAvailableBibles().length,
-    searchMode: SEARCH_MODE,
-    semanticSearch: SEMANTIC_SEARCH,
-    embeddingIndexReady: Boolean(embeddingIndex),
-    embeddingProvider: EMBEDDING_PROVIDER,
-    embeddingModel:
-      EMBEDDING_PROVIDER === "local" ? LOCAL_EMBED_MODEL : OPENAI_EMBEDDING_MODEL,
-    localEmbedUrl: LOCAL_EMBED_URL,
-    sttMode: STT_MODE,
-    deepgramConfigured: isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG),
-    licenseMode: LICENSE_CONFIG.enabled,
-    licenseConfigured: Boolean(LICENSE_CONFIG.licenseKey),
-    proxyUrl: LICENSE_CONFIG.proxyUrl || null,
-    deepgramModel: DEEPGRAM_MODEL,
-    deepgramLanguage: DEEPGRAM_LANGUAGE,
-    streamingAvailable: STREAMING_AVAILABLE,
-    deepgramKeywords: DEEPGRAM_KEYWORDS_ENABLED,
-    mlxSttUrl: MLX_STT_URL,
-    mlxSttAvailable: mlxProbe.ok,
-    mlxSttModelLoaded: mlxProbe.modelLoaded ?? false,
-    mlxSttAvgInferenceMs: mlxProbe.avgInferenceMs,
-    openAITranscribeModel: OPENAI_TRANSCRIBE_MODEL,
-    openAIConfigured: Boolean(process.env.OPENAI_API_KEY),
-    biblicalLexicon: getLexiconStats(),
-    sttCloudReady:
-      isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG) ||
-      (Boolean(process.env.OPENAI_API_KEY) && STT_MODE !== "local"),
-    whisperConfigured:
-      WHISPER_MODE === "local" &&
-      Boolean(WHISPER_BIN) &&
-      fs.existsSync(WHISPER_MODEL_PATH),
-    whisperBeamSize: WHISPER_BEAM_SIZE,
-    whisperModel: path.basename(WHISPER_MODEL_PATH),
-    whisperPromptConfigured: Boolean(WHISPER_CPP_PROMPT),
-    openaiTranscribeUsePrompt: OPENAI_TRANSCRIBE_USE_PROMPT,
-    openaiTranscribePromptChars: OPENAI_TRANSCRIBE_PROMPT.length,
-    whisperVad: WHISPER_USE_VAD,
-    whisperNoGpu: WHISPER_NO_GPU,
-  });
+  try {
+    const mlxProbe = await sttService.probeMlxStt();
+    res.json({
+      ok: true,
+      verses: VERSES.length,
+      bibleVersion: activeBibleSlug,
+      bibleName: BIBLE_META.name,
+      bibleVersionsAvailable: listAvailableBibles().length,
+      searchMode: SEARCH_MODE,
+      semanticSearch: SEMANTIC_SEARCH,
+      embeddingIndexReady: Boolean(embeddingIndex),
+      embeddingProvider: EMBEDDING_PROVIDER,
+      embeddingModel:
+        EMBEDDING_PROVIDER === "local" ? LOCAL_EMBED_MODEL : OPENAI_EMBEDDING_MODEL,
+      localEmbedUrl: LOCAL_EMBED_URL,
+      sttMode: sttService.sttMode,
+      deepgramConfigured: sttService.deepgramConfigured,
+      licenseMode: LICENSE_CONFIG.enabled,
+      licenseConfigured: Boolean(LICENSE_CONFIG.licenseKey),
+      proxyUrl: LICENSE_CONFIG.proxyUrl || null,
+      deepgramModel: sttService.deepgramModel,
+      deepgramLanguage: sttService.deepgramLanguage,
+      streamingAvailable: sttService.streamingAvailable,
+      deepgramKeywords: sttService.deepgramKeywords,
+      mlxSttUrl: sttService.mlxSttUrl,
+      mlxSttAvailable: mlxProbe.ok,
+      mlxSttModelLoaded: mlxProbe.modelLoaded ?? false,
+      mlxSttAvgInferenceMs: mlxProbe.avgInferenceMs,
+      openAITranscribeModel: sttService.openAITranscribeModel,
+      openAIConfigured: sttService.openAIConfigured,
+      biblicalLexicon: getLexiconStats(),
+      sttCloudReady: sttService.sttCloudReady,
+      whisperConfigured: sttService.whisperConfigured,
+      whisperBeamSize: sttService.whisperBeamSize,
+      whisperModel: sttService.whisperModel,
+      whisperPromptConfigured: sttService.whisperPromptConfigured,
+      openaiTranscribeUsePrompt: sttService.openaiTranscribeUsePrompt,
+      openaiTranscribePromptChars: sttService.openaiTranscribePromptChars,
+      whisperVad: sttService.whisperVad,
+      whisperNoGpu: sttService.whisperNoGpu,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.message || "Health check impossible.",
+    });
+  }
 });
 
 // Always return JSON on JSON parsing errors (prevents empty/non-JSON responses).
@@ -2254,161 +1409,27 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
-// ---------------------------------------------------------------------------
-// Streaming STT : relais WebSocket navigateur <-> Deepgram Listen (live).
-// Le navigateur envoie du PCM 16 bits / 16 kHz mono ; on relaie tel quel.
-// ---------------------------------------------------------------------------
-function buildDeepgramStreamUrl(sampleRate = 16000) {
-  const params = new URLSearchParams({
-    model: DEEPGRAM_MODEL,
-    language: DEEPGRAM_LANGUAGE,
-    encoding: "linear16",
-    sample_rate: String(sampleRate),
-    channels: "1",
-    interim_results: "true",
-    smart_format: "true",
-    punctuate: "true",
-    endpointing: "300",
-    vad_events: "true",
-  });
-  if (DEEPGRAM_KEYWORDS_ENABLED) {
-    for (const term of DEEPGRAM_BIBLE_KEYTERMS) {
-      params.append("keywords", `${term}:2`);
-    }
-  }
-  return `wss://api.deepgram.com/v1/listen?${params}`;
-}
-
-function attachSttStream(server) {
-  const wss = new WebSocketServer({ server, path: "/stt/stream" });
-
-  wss.on("connection", (client, req) => {
-    if (!isDeepgramAvailable(DEEPGRAM_API_KEY, LICENSE_CONFIG)) {
-      client.send(
-        JSON.stringify({
-          type: "error",
-          error:
-            "STT cloud indisponible : configure DEEPGRAM_API_KEY ou VERSEPILOT_LICENSE_KEY + VERSEPILOT_PROXY_URL.",
-        })
-      );
-      client.close();
-      return;
-    }
-
-    const url = new URL(req.url, "http://localhost");
-    const sampleRate = Number(url.searchParams.get("sampleRate")) || 16000;
-
-    const upstreamUrl = LICENSE_CONFIG.enabled
-      ? `${proxyWsUrl(LICENSE_CONFIG.proxyUrl)}?sampleRate=${sampleRate}`
-      : buildDeepgramStreamUrl(sampleRate);
-    const upstreamHeaders = LICENSE_CONFIG.enabled
-      ? { "X-VersePilot-License": LICENSE_CONFIG.licenseKey }
-      : { Authorization: `Token ${DEEPGRAM_API_KEY}` };
-
-    const dg = new WebSocket(upstreamUrl, { headers: upstreamHeaders });
-
-    let dgOpen = false;
-    const audioBacklog = [];
-    let keepAlive = null;
-
-    dg.on("open", () => {
-      dgOpen = true;
-      for (const buf of audioBacklog) dg.send(buf);
-      audioBacklog.length = 0;
-      keepAlive = setInterval(() => {
-        if (dg.readyState === WebSocket.OPEN) {
-          dg.send(JSON.stringify({ type: "KeepAlive" }));
-        }
-      }, 8000);
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({ type: "ready" }));
-      }
-    });
-
-    dg.on("message", (raw) => {
-      let data = null;
-      try {
-        data = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-      if (data.type === "Results") {
-        const alt = data.channel?.alternatives?.[0];
-        const text = (alt?.transcript || "").trim();
-        if (!text) return;
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(
-            JSON.stringify({
-              type: "transcript",
-              text,
-              isFinal: Boolean(data.is_final),
-              speechFinal: Boolean(data.speech_final),
-              confidence: alt?.confidence ?? null,
-            })
-          );
-        }
-      }
-    });
-
-    dg.on("error", (err) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(
-          JSON.stringify({ type: "error", error: `Deepgram: ${err.message}` })
-        );
-      }
-    });
-
-    dg.on("close", () => {
-      if (keepAlive) clearInterval(keepAlive);
-      if (client.readyState === WebSocket.OPEN) client.close();
-    });
-
-    client.on("message", (data, isBinary) => {
-      if (isBinary) {
-        if (dgOpen && dg.readyState === WebSocket.OPEN) {
-          dg.send(data);
-        } else {
-          audioBacklog.push(data);
-        }
-        return;
-      }
-      // Message texte de contrôle (ex: finalize/close).
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === "CloseStream" && dg.readyState === WebSocket.OPEN) {
-          dg.send(JSON.stringify({ type: "CloseStream" }));
-        }
-      } catch {
-        /* ignore */
-      }
-    });
-
-    client.on("close", () => {
-      if (keepAlive) clearInterval(keepAlive);
-      if (dg.readyState === WebSocket.OPEN) {
-        try {
-          dg.send(JSON.stringify({ type: "CloseStream" }));
-        } catch {
-          /* ignore */
-        }
-      }
-      dg.close();
-    });
-
-    client.on("error", () => {
-      if (keepAlive) clearInterval(keepAlive);
-      dg.close();
-    });
-  });
-
-  console.log("🔌 STT streaming WebSocket prêt sur /stt/stream");
-}
-
 const httpServer = http.createServer(app);
-attachSttStream(httpServer);
+sttService.attachSttStream(httpServer);
+httpServer.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(
+      `\n✗ Port ${PORT} déjà utilisé. Un autre backend tourne peut-être encore.\n` +
+        `  macOS/Linux : lsof -ti :${PORT} | xargs kill -9\n` +
+        `  Puis relance : npm run dev\n`
+    );
+    process.exit(1);
+  }
+  console.error("✗ Erreur serveur HTTP :", err.message);
+  process.exit(1);
+});
 httpServer.listen(PORT, () => {
   console.log(`✅ VersePilot Live backend ready on http://localhost:${PORT}`);
-  if (STREAMING_AVAILABLE) {
+  if (sttService.streamingAvailable) {
     console.log("🎧 Streaming Deepgram disponible (mode temps réel).");
+  } else if (sttService.sttMode === "mlx") {
+    console.log(
+      "ℹ️  STT_MODE=mlx sans streaming Deepgram — lance : npm run mlx-stt --prefix backend"
+    );
   }
 });

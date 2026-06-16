@@ -28,7 +28,7 @@
     "release:win": "node scripts/release.mjs --win",
     "release:dir": "node scripts/release.mjs --dir",
     "license-proxy": "npm start --prefix services/license-proxy",
-    "license-proxy:dev": "npm run dev --prefix services/license-proxy",
+    "test": "npm test --prefix backend && npm test --prefix frontend",
     "dist": "npm run release:dir",
     "dist:mac": "npm run release:mac",
     "dist:win": "npm run release:win"
