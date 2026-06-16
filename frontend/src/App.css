@@ -419,6 +419,51 @@ kbd {
   font-size: 14px;
   margin-bottom: 24px;
   font-family: var(--font-mono);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.error-action-btn,
+.bible-install-btn {
+  flex-shrink: 0;
+  border: 1px solid rgba(124, 92, 255, 0.55);
+  background: rgba(124, 92, 255, 0.15);
+  color: #d8ccff;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.error-action-btn:hover:not(:disabled),
+.bible-install-btn:hover:not(:disabled) {
+  background: rgba(124, 92, 255, 0.28);
+}
+
+.error-action-btn:disabled,
+.bible-install-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.bible-install-btn {
+  margin-left: 8px;
+}
+
+.bible-import-status {
+  margin: -12px 0 20px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid rgba(124, 92, 255, 0.35);
+  background: rgba(124, 92, 255, 0.08);
+  color: #c9b8ff;
+  font-size: 13px;
+  font-family: var(--font-mono);
 }
 
 /* Results ----------------------------------------------------------------- */
@@ -1440,6 +1485,46 @@ kbd {
   background: rgba(212, 255, 58, 0.06);
   font-size: 13px;
   color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.embedding-build-btn {
+  flex-shrink: 0;
+  border: 1px solid rgba(212, 255, 58, 0.45);
+  background: rgba(212, 255, 58, 0.1);
+  color: #e8ff9a;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.embedding-build-btn:hover:not(:disabled) {
+  background: rgba(212, 255, 58, 0.18);
+}
+
+.embedding-build-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.embedding-build-status {
+  position: relative;
+  z-index: 2;
+  margin: 8px 32px 0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid rgba(212, 255, 58, 0.35);
+  background: rgba(212, 255, 58, 0.06);
+  color: #d4e88a;
+  font-size: 13px;
+  font-family: var(--font-mono);
 }
 
 .verse-card.compact {

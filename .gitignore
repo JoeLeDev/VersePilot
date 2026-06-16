@@ -20,11 +20,16 @@ services/license-proxy/.env
 services/license-proxy/licenses.json
 services/license-proxy/node_modules/
 
-# Bibles & embeddings (lourds — régénérer avec npm run import-bibles / build-embeddings)
+# Bibles & embeddings (lourds — générés automatiquement par npm run release)
 backend/data/bibles/*.json
 !backend/data/bibles/index.json
 backend/data/bibles/*.embeddings.bin
 backend/data/bibles/*.embeddings.meta.json
+backend/data/bibles/*.local.embeddings.bin
+backend/data/bibles/*.local.embeddings.meta.json
+
+# Modèle e5 embarqué (npm run download-embed-model --prefix backend)
+backend/models/transformers/
 
 # Modèles Whisper local (télécharger séparément)
 backend/models/

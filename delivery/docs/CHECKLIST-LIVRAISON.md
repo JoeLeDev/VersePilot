@@ -7,8 +7,10 @@ Liste pour préparer une livraison avec **abonnement dictée vocale** (Deepgram 
 ## Avant le build
 
 - [ ] Node.js 18+ sur la machine de build
-- [ ] `npm run bootstrap` ou `bootstrap:full` exécuté
+- [ ] `npm run release` (importe bibles + index sémantique + modèle e5 **automatiquement**)
 - [ ] Louis Segond présent : `backend/data/bibles/louis-segond.json`
+- [ ] Index sémantique : `backend/data/bibles/louis-segond.local.embeddings.bin`
+- [ ] Modèle e5 : `backend/models/transformers/` (requêtes hors-ligne)
 - [ ] Lexique : `backend/data/biblical-lexicon.json`
 - [ ] **Proxy licence** déployé (ou clé Deepgram directe pour 1er client)
 - [ ] `delivery/default.env` personnalisé pour l'église
@@ -77,6 +79,7 @@ VERSEPILOT_PROXY_URL=
 ## Test avant envoi
 
 - [ ] App installée sans cloner le dépôt
+- [ ] **Aucun bandeau** « Installer les Bibles » / « Générer l'index » (tout est embarqué)
 - [ ] Indicateur **streaming** visible
 - [ ] Dictée temps réel fluide (parler 30 s)
 - [ ] Détection verset + envoi ProPresenter OK
@@ -108,6 +111,7 @@ curl -H "X-VersePilot-License: VP-..." https://api.versepilot.tondomaine.fr/v1/l
 |---------|--------|
 | Clé Deepgram maître | Sur ton proxy uniquement |
 | Signature Apple | Hors scope actuel |
+| Python / terminal | **Rien à installer côté client** — bibles + index + modèle e5 inclus |
 | Whisper / MLX | Secours optionnel, pas requis avec abonnement |
 
 ---

@@ -74,6 +74,7 @@ function startBackend() {
       ...process.env,
       PORT: BACKEND_PORT,
       VERSEPILOT_ENV_FILE: userEnvPath,
+      VERSEPILOT_PACKAGED: app.isPackaged ? "1" : "0",
     },
     stdio: "inherit",
   });

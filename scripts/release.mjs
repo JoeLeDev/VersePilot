@@ -3,29 +3,33 @@
  * Prépare et construit un installeur VersePilot Live pour livraison client.
  *
  * Usage :
- *   npm run release          # macOS (dmg) par défaut sur Mac, win sur Windows
- *   npm run release:mac      # dmg macOS (sans signature Apple)
+ *   npm run release          # build complet client (bibles + index sémantique inclus)
+ *   npm run release:mac      # dmg macOS
  *   npm run release:win      # installeur NSIS Windows
  *   npm run release:dir      # dossier .app / win-unpacked (test rapide)
  *
  * Options :
- *   --skip-install   ne pas relancer npm install
- *   --skip-bibles    ne pas vérifier les fichiers bible JSON
- *   --with-bibles    importe les bibles avant le build (long)
+ *   --skip-install      ne pas relancer npm install
+ *   --skip-bibles       ne pas vérifier / importer les bibles
+ *   --skip-embeddings   ne pas vérifier / générer l'index sémantique
+ *   --with-bibles       (legacy) importe les bibles si absentes
  */
-import { spawnSync } from "child_process";
+import { spawnSync, spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
-const BACKEND_DATA = path.join(ROOT, "backend", "data");
+const BACKEND = path.join(ROOT, "backend");
+const BACKEND_DATA = path.join(BACKEND, "data");
 const BIBLES_DIR = path.join(BACKEND_DATA, "bibles");
+const DEFAULT_BIBLE = "louis-segond";
 
 const args = process.argv.slice(2);
 const skipInstall = args.includes("--skip-install");
 const skipBibles = args.includes("--skip-bibles");
+const skipEmbeddings = args.includes("--skip-embeddings");
 const withBibles = args.includes("--with-bibles");
 const wantMac = args.includes("--mac") || (!args.includes("--win") && process.platform === "darwin");
 const wantWin = args.includes("--win") || (!args.includes("--mac") && process.platform === "win32");
@@ -58,6 +62,107 @@ function fileSizeMb(filePath) {
   return (stat.size / (1024 * 1024)).toFixed(1);
 }
 
+function bibleJsonPath(slug = DEFAULT_BIBLE) {
+  return path.join(BIBLES_DIR, `${slug}.json`);
+}
+
+function localEmbeddingBinPath(slug = DEFAULT_BIBLE) {
+  return path.join(BIBLES_DIR, `${slug}.local.embeddings.bin`);
+}
+
+function localEmbeddingMetaPath(slug = DEFAULT_BIBLE) {
+  return path.join(BIBLES_DIR, `${slug}.local.embeddings.meta.json`);
+}
+
+async function probeEmbedServer() {
+  const url = (process.env.LOCAL_EMBED_URL || "http://127.0.0.1:8003").replace(/\/$/, "");
+  try {
+    const r = await fetch(`${url}/health`, { signal: AbortSignal.timeout(2500) });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+function ensureBibles() {
+  if (skipBibles) return;
+
+  if (!fs.existsSync(bibleJsonPath())) {
+    console.log("→ Bible Louis Segond absente — import automatique…");
+    run("import-bibles", "npm", ["run", "import-bibles", "--prefix", "backend", "--", DEFAULT_BIBLE]);
+  } else if (withBibles) {
+    run("import-bibles", "npm", ["run", "import-bibles", "--prefix", "backend"]);
+  }
+}
+
+async function ensureEmbeddings() {
+  if (skipEmbeddings) return;
+
+  if (
+    fs.existsSync(localEmbeddingBinPath()) &&
+    fs.existsSync(localEmbeddingMetaPath())
+  ) {
+    console.log(`✓ Index sémantique local : ${fileSizeMb(localEmbeddingBinPath())} Mo`);
+    return;
+  }
+
+  console.log("→ Index sémantique absent — génération automatique (machine de build)…");
+
+  if (!fs.existsSync(bibleJsonPath())) {
+    ensureBibles();
+  }
+
+  if (!(await probeEmbedServer())) {
+    console.log("→ Démarrage du serveur d'embeddings Python (machine de build uniquement)…");
+    const script = path.join(BACKEND, "scripts", "embeddings", "local_embed_server.py");
+    const child = spawn("python3", [script], {
+      cwd: BACKEND,
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+    const start = Date.now();
+    while (Date.now() - start < 90000) {
+      if (await probeEmbedServer()) break;
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    if (!(await probeEmbedServer())) {
+      console.error(
+        "✗ Serveur d'embeddings local requis pour le build.\n" +
+          "   Terminal 1 : npm run embed-server --prefix backend\n" +
+          "   Terminal 2 : npm run release"
+      );
+      process.exit(1);
+    }
+  }
+
+  run("build-embeddings:local", "npm", [
+    "run",
+    "build-embeddings:local",
+    "--prefix",
+    "backend",
+    "--",
+    DEFAULT_BIBLE,
+  ]);
+}
+
+function ensureQueryModel() {
+  if (skipEmbeddings) return;
+
+  const modelDir = path.join(BACKEND, "models", "transformers");
+  const hasCache =
+    fs.existsSync(modelDir) &&
+    fs.readdirSync(modelDir, { recursive: true }).some((f) => String(f).includes("multilingual-e5"));
+
+  if (hasCache) {
+    console.log("✓ Modèle e5 embarqué pour les requêtes sémantiques");
+    return;
+  }
+
+  console.log("→ Téléchargement du modèle e5 pour l'app client (hors-ligne)…");
+  run("download-embed-model", "npm", ["run", "download-embed-model", "--prefix", "backend"], BACKEND);
+}
+
 function verifyReleaseData() {
   const required = [
     path.join(ROOT, "delivery", "default.env"),
@@ -76,12 +181,10 @@ function verifyReleaseData() {
   }
 
   if (!skipBibles) {
-    const louisSegond = path.join(BIBLES_DIR, "louis-segond.json");
+    const louisSegond = bibleJsonPath();
     if (!fs.existsSync(louisSegond)) {
       console.error(
-        "✗ Louis Segond manquant (backend/data/bibles/louis-segond.json).\n" +
-          "   Lance : npm run bootstrap:full\n" +
-          "   ou    : npm run release -- --with-bibles"
+        "✗ Louis Segond manquant. Relancez npm run release (import automatique)."
       );
       process.exit(1);
     }
@@ -96,6 +199,14 @@ function verifyReleaseData() {
     console.log(
       `✓ ${bibleFiles.length} fichier(s) bible embarqué(s) (~${(totalMb / (1024 * 1024)).toFixed(0)} Mo)`
     );
+  }
+
+  if (!skipEmbeddings) {
+    if (!fs.existsSync(localEmbeddingBinPath())) {
+      console.error("✗ Index sémantique local manquant après préparation.");
+      process.exit(1);
+    }
+    console.log(`✓ Index sémantique : ${fileSizeMb(localEmbeddingBinPath())} Mo`);
   }
 
   const lexicon = path.join(BACKEND_DATA, "biblical-lexicon.json");
@@ -139,11 +250,11 @@ function printArtifacts() {
     }
   }
 
-  console.log("\n📋 Livraison client :");
+  console.log("\n📋 Livraison client (zéro terminal) :");
   console.log("   1. Transférer le fichier d'installation (dmg / exe)");
-  console.log("   2. Joindre delivery/docs/GUIDE-INSTALLATION.md");
-  console.log("   3. Joindre delivery/docs/GUIDE-PROPRESENTER.md");
-  console.log("   (Les guides sont aussi copiés dans l'app : Resources/docs/)");
+  console.log("   2. Client : installer → ouvrir → Démarrer le live");
+  console.log("   3. Bibles + index sémantique déjà inclus dans l'installeur");
+  console.log("   4. Joindre delivery/docs/GUIDE-INSTALLATION.md");
   console.log("\n⚠ macOS sans signature : clic droit → Ouvrir la première fois.");
 }
 
@@ -152,20 +263,20 @@ console.log("  VersePilot Live — build de livraison");
 console.log("═══════════════════════════════════════════\n");
 
 checkNode();
-verifyReleaseData();
-
-if (withBibles) {
-  run("import-bibles", "npm", ["run", "import-bibles", "--prefix", "backend"]);
-}
 
 if (!skipInstall) {
   run("npm install (racine)", "npm", ["install"], ROOT);
-  run("npm install (backend)", "npm", ["install"], path.join(ROOT, "backend"));
+  run("npm install (backend)", "npm", ["install"], BACKEND);
   run("npm install (frontend)", "npm", ["install"], path.join(ROOT, "frontend"));
 }
+
+ensureBibles();
+await ensureEmbeddings();
+ensureQueryModel();
+verifyReleaseData();
 
 run("build frontend", "npm", ["run", "build", "--prefix", "frontend"]);
 run("electron-builder", "npx", electronBuilderArgs(), ROOT);
 
 printArtifacts();
-console.log("\n✓ Build terminé.\n");
+console.log("\n✓ Build terminé — prêt pour client non technique.\n");

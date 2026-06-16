@@ -10,7 +10,7 @@
 
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { bookToFrench, normalizeBookDisplay } from "../lib/book-names.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -239,12 +239,12 @@ function writeIndex(imported) {
   fs.writeFileSync(path.join(DATA_DIR, "index.json"), JSON.stringify(index, null, 2));
 }
 
-async function main() {
+/**
+ * @param {{ slugs?: string[], useLegacy?: boolean, onProgress?: (p: object) => void }} opts
+ */
+export async function runBibleImport(opts = {}) {
+  const { slugs = [], useLegacy = false, onProgress } = opts;
   fs.mkdirSync(DATA_DIR, { recursive: true });
-
-  const args = process.argv.slice(2);
-  const useLegacy = args.includes("--legacy");
-  const slugs = args.filter((a) => !a.startsWith("--"));
 
   let catalog = JSON.parse(fs.readFileSync(CATALOG_PATH, "utf-8"));
   if (useLegacy && fs.existsSync(LEGACY_CATALOG_PATH)) {
@@ -253,20 +253,40 @@ async function main() {
   } else if (slugs.length) {
     catalog = catalog.filter((v) => slugs.includes(v.slug));
     if (!catalog.length) {
-      console.error("Slugs introuvables. Disponibles :");
-      JSON.parse(fs.readFileSync(CATALOG_PATH, "utf-8")).forEach((v) =>
-        console.error(`  - ${v.slug}`)
+      const available = JSON.parse(fs.readFileSync(CATALOG_PATH, "utf-8")).map(
+        (v) => v.slug
       );
-      process.exit(1);
+      throw new Error(
+        `Version(s) introuvable(s). Disponibles : ${available.join(", ")}`
+      );
     }
   } else {
     console.log(`Import prioritaire (${catalog.length} entrées)…\n`);
   }
 
   const imported = [];
-  for (const meta of catalog) {
+  const total = catalog.length;
+  for (let i = 0; i < catalog.length; i += 1) {
+    const meta = catalog[i];
+    onProgress?.({
+      phase: "importing",
+      current: i + 1,
+      total,
+      slug: meta.slug,
+      name: meta.name,
+      message: `Téléchargement de ${meta.name}…`,
+    });
     try {
       imported.push(await importVersion(meta));
+      onProgress?.({
+        phase: "importing",
+        current: i + 1,
+        total,
+        slug: meta.slug,
+        name: meta.name,
+        message: `${meta.name} importée`,
+        ok: true,
+      });
     } catch (err) {
       console.log(`ERREUR ${meta.slug}: ${err.message}`);
       imported.push({
@@ -276,15 +296,56 @@ async function main() {
         available: false,
         importError: err.message,
       });
+      onProgress?.({
+        phase: "importing",
+        current: i + 1,
+        total,
+        slug: meta.slug,
+        name: meta.name,
+        message: err.message,
+        ok: false,
+      });
     }
   }
 
   writeIndex(imported);
   const ok = imported.filter((v) => v.available && v.verseCount > 0).length;
   console.log(`\n✅ ${ok} bible(s) complète(s) · ${imported.length} entrée(s) dans index.json`);
+  return {
+    imported,
+    completeCount: ok,
+    totalCount: imported.length,
+    versions: imported
+      .filter((v) => v.available && v.verseCount > 0)
+      .map((v) => ({
+        slug: v.slug,
+        name: v.name,
+        verseCount: v.verseCount,
+      })),
+  };
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+async function main() {
+  const args = process.argv.slice(2);
+  try {
+    await runBibleImport({
+      slugs: args.filter((a) => !a.startsWith("--")),
+      useLegacy: args.includes("--legacy"),
+    });
+  } catch (err) {
+    console.error(err.message || err);
+    process.exit(1);
+  }
+}
+
+function isDirectExecution() {
+  if (!process.argv[1]) return false;
+  return import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+}
+
+if (isDirectExecution()) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

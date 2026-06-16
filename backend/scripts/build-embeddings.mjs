@@ -2,43 +2,29 @@
 /**
  * Construit l'index d'embeddings pour une bible (1 fichier .bin + .meta.json).
  *
- * Deux fournisseurs :
- *   - openai (défaut) : text-embedding-3-small via l'API OpenAI.
- *       npm run build-embeddings              # bible active
- *       npm run build-embeddings -- darby     # versions précises
- *   - local : serveur d'embeddings local (sentence-transformers, hors-ligne).
- *       npm run build-embeddings:local
- *       npm run build-embeddings:local -- darby
- *
- * Le fournisseur peut être forcé par --local / --openai ou EMBEDDINGS_PROVIDER.
- * Les index locaux sont écrits dans `${slug}.local.embeddings.*` pour cohabiter
- * avec les index OpenAI (`${slug}.embeddings.*`).
+ * Usage:
+ *   npm run build-embeddings              # bible active
+ *   npm run build-embeddings -- darby
+ *   npm run build-embeddings:local
  */
 
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import { verseKey, embeddingVariantSuffix } from "../lib/verse-embeddings.js";
 
-dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".env") });
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BIBLES_DIR = path.join(__dirname, "..", "data", "bibles");
 
-const args = process.argv.slice(2);
-const flags = new Set(args.filter((a) => a.startsWith("--")));
-const slugArgs = args.filter((a) => !a.startsWith("--"));
-
-let provider = (process.env.EMBEDDINGS_PROVIDER || "openai").toLowerCase();
-if (flags.has("--local")) provider = "local";
-if (flags.has("--openai")) provider = "openai";
-
 const OPENAI_MODEL = process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
-const LOCAL_EMBED_URL = (process.env.LOCAL_EMBED_URL || "http://127.0.0.1:8003").replace(/\/$/, "");
-const LOCAL_EMBED_MODEL = process.env.LOCAL_EMBED_MODEL || "intfloat/multilingual-e5-small";
-const BATCH_SIZE = Number(process.env.EMBEDDING_BATCH_SIZE || (provider === "local" ? 64 : 256));
+const LOCAL_EMBED_URL = (process.env.LOCAL_EMBED_URL || "http://127.0.0.1:8003").replace(
+  /\/$/,
+  ""
+);
+const LOCAL_EMBED_MODEL =
+  process.env.LOCAL_EMBED_MODEL || "intfloat/multilingual-e5-small";
 
 function verseInput(v) {
   const ref = `${v.book} ${v.chapter}:${v.verse}`;
@@ -64,56 +50,104 @@ async function embedBatchLocal(inputs) {
   return data.embeddings || [];
 }
 
-async function main() {
-  const slugs = slugArgs.length ? slugArgs : [process.env.BIBLE_VERSION || "louis-segond"];
+async function warmupLocalEmbedServer() {
+  try {
+    await fetch(`${LOCAL_EMBED_URL}/warmup`, { method: "POST", signal: AbortSignal.timeout(120000) });
+    return true;
+  } catch (err) {
+    throw new Error(
+      `Serveur d'embeddings local injoignable sur ${LOCAL_EMBED_URL}. ` +
+        `Lance d'abord : npm run embed-server (${err.message})`
+    );
+  }
+}
+
+function resolveProvider(requested) {
+  if (requested === "local" || requested === "openai") return requested;
+  const semantic = (process.env.SEMANTIC_SEARCH || "openai").toLowerCase();
+  if (semantic === "local") return "local";
+  if (semantic === "off") return "openai";
+  return semantic === "openai" ? "openai" : "local";
+}
+
+/**
+ * @param {{ slugs?: string[], provider?: string, onProgress?: (p: object) => void }} opts
+ */
+export async function runBuildEmbeddings(opts = {}) {
+  const slugs =
+    opts.slugs?.length > 0
+      ? opts.slugs
+      : [process.env.BIBLE_VERSION || "louis-segond"];
+  const provider = resolveProvider(opts.provider);
+  const onProgress = opts.onProgress;
+  const batchSize = Number(
+    process.env.EMBEDDING_BATCH_SIZE || (provider === "local" ? 64 : 256)
+  );
 
   let openai = null;
   if (provider === "openai") {
     if (!process.env.OPENAI_API_KEY) {
-      console.error("OPENAI_API_KEY manquant dans backend/.env");
-      process.exit(1);
+      throw new Error(
+        "OPENAI_API_KEY manquant. Configure la clé ou passe SEMANTIC_SEARCH=local."
+      );
     }
     openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   } else {
-    // Vérifie que le serveur local répond et préchauffe le modèle.
-    try {
-      await fetch(`${LOCAL_EMBED_URL}/warmup`, { method: "POST" });
-    } catch {
-      console.error(
-        `Serveur d'embeddings local injoignable sur ${LOCAL_EMBED_URL}.\n` +
-          "Lance-le d'abord : npm run embed-server"
-      );
-      process.exit(1);
-    }
+    onProgress?.({
+      phase: "warmup",
+      message: "Connexion au serveur d'embeddings local…",
+    });
+    await warmupLocalEmbedServer();
   }
 
   const modelLabel = provider === "local" ? LOCAL_EMBED_MODEL : OPENAI_MODEL;
   const suffix = embeddingVariantSuffix(provider);
+  const built = [];
 
-  for (const slug of slugs) {
+  for (let s = 0; s < slugs.length; s += 1) {
+    const slug = slugs[s];
     const biblePath = path.join(BIBLES_DIR, `${slug}.json`);
     if (!fs.existsSync(biblePath)) {
-      console.error(`Fichier introuvable: ${biblePath}`);
-      continue;
+      throw new Error(`Bible « ${slug} » introuvable. Installez-la d'abord.`);
     }
 
     const payload = JSON.parse(fs.readFileSync(biblePath, "utf-8"));
     const verses = payload.verses || payload;
     if (!verses.length) {
-      console.error(`${slug}: aucun verset`);
-      continue;
+      throw new Error(`${slug} : aucun verset dans le fichier.`);
     }
 
-    console.log(`\n→ ${slug} — ${verses.length} versets, [${provider}] ${modelLabel}`);
+    onProgress?.({
+      phase: "building",
+      slug,
+      current: s + 1,
+      total: slugs.length,
+      verseCount: verses.length,
+      batch: 0,
+      totalBatches: Math.ceil(verses.length / batchSize),
+      message: `Index sémantique : ${slug} (0 / ${verses.length} versets)…`,
+    });
 
     const allEmbeddings = [];
     let dimensions = 0;
-    const totalBatches = Math.ceil(verses.length / BATCH_SIZE);
+    const totalBatches = Math.ceil(verses.length / batchSize);
 
-    for (let i = 0; i < verses.length; i += BATCH_SIZE) {
-      const batch = verses.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < verses.length; i += batchSize) {
+      const batchNum = Math.floor(i / batchSize) + 1;
+      const batch = verses.slice(i, i + batchSize);
       const inputs = batch.map(verseInput);
-      process.stdout.write(`  batch ${Math.floor(i / BATCH_SIZE) + 1}/${totalBatches}... `);
+
+      onProgress?.({
+        phase: "building",
+        slug,
+        current: s + 1,
+        total: slugs.length,
+        verseCount: verses.length,
+        batch: batchNum,
+        totalBatches,
+        processedVerses: Math.min(i + batch.length, verses.length),
+        message: `${slug} : ${Math.min(i + batch.length, verses.length)} / ${verses.length} versets…`,
+      });
 
       const embeddings =
         provider === "local"
@@ -124,7 +158,6 @@ async function main() {
         if (!dimensions) dimensions = emb.length;
         allEmbeddings.push(emb);
       }
-      console.log("ok");
     }
 
     const flat = new Float32Array(allEmbeddings.length * dimensions);
@@ -148,14 +181,36 @@ async function main() {
     fs.writeFileSync(binPath, Buffer.from(flat.buffer));
     fs.writeFileSync(metaPath, JSON.stringify(meta));
 
-    const mb = (fs.statSync(binPath).size / 1024 / 1024).toFixed(1);
-    console.log(`✅ ${slug}: ${binPath} (${mb} Mo, ${dimensions}D × ${verses.length})`);
+    const mb = Number((fs.statSync(binPath).size / 1024 / 1024).toFixed(1));
+    built.push({ slug, provider, model: modelLabel, verseCount: verses.length, sizeMb: mb });
   }
 
-  console.log("\nRedémarre le backend pour charger l'index.");
+  return { built, provider, model: modelLabel };
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+async function main() {
+  const args = process.argv.slice(2);
+  const flags = new Set(args.filter((a) => a.startsWith("--")));
+  const slugArgs = args.filter((a) => !a.startsWith("--"));
+  let provider;
+  if (flags.has("--local")) provider = "local";
+  if (flags.has("--openai")) provider = "openai";
+
+  try {
+    await runBuildEmbeddings({ slugs: slugArgs, provider });
+    console.log("\nRedémarre le backend pour charger l'index.");
+  } catch (err) {
+    console.error(err.message || err);
+    process.exit(1);
+  }
+}
+
+function isDirectExecution() {
+  if (!process.argv[1]) return false;
+  return import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+}
+
+if (isDirectExecution()) {
+  dotenv.config({ path: path.join(__dirname, "..", ".env") });
+  main();
+}
